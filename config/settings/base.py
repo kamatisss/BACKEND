@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -20,7 +21,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-89y+_775k!dukhcc_25js+b0pi$y!3h8e7abp&emw&dn57q&*@'
+# Set DJANGO_SECRET_KEY in your .env file (see .env.example).
+SECRET_KEY = os.environ.get(
+    'DJANGO_SECRET_KEY',
+    'django-insecure-CHANGE-ME-set-DJANGO_SECRET_KEY-in-dotenv'
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -138,8 +143,6 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
-import os
-
 STATIC_URL = 'static/'
 
 MEDIA_URL = '/media/'
@@ -147,14 +150,12 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 
 # ─── Stripe Configuration ─────────────────────────────────────────────────────
-# IMPORTANT: Replace these test keys with your real keys from https://dashboard.stripe.com
-# Test Secret Key  → starts with sk_test_...
-# Test Webhook Secret → starts with whsec_...  (get from Stripe Dashboard > Webhooks)
-STRIPE_SECRET_KEY  = 'sk_test_51TWHkRKx56f1fyJOrlOwC8QvvsNtBEiu1p2kCHquRsXTAqebWFKj7AhpasyIipRFFcMMT1HtbOfcDDDlyCMZmFnb00hF5s1a3h'
-STRIPE_WEBHOOK_SECRET = 'whsec_REPLACE_WITH_YOUR_WEBHOOK_SECRET'
+# Set these in your .env file (see .env.example). Never commit real keys.
+STRIPE_SECRET_KEY     = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 
 # The base URL of your React frontend (used to build Stripe success/cancel redirect URLs)
-FRONTEND_URL = 'http://localhost:5173'
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/6.0/ref/settings/#default-auto-field

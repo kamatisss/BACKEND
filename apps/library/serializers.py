@@ -77,7 +77,7 @@ class GardenDesignListSerializer(serializers.ModelSerializer):
     """Lighter serializer for list views (no placed_items blob)."""
     class Meta:
         model = GardenDesign
-        fields = ['id', 'name', 'total_cost', 'created_at', 'updated_at']
+        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at']
 
 class BlackoutDateSerializer(serializers.ModelSerializer):
     class Meta:
@@ -107,4 +107,5 @@ class OrderSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Order
-        fields = ['id', 'customer_name', 'customer_email', 'customer_address', 'booking_date', 'total_price', 'created_at', 'items']
+        fields = ['id', 'customer_name', 'customer_email', 'customer_address',
+                  'booking_date', 'total_price', 'status', 'created_at', 'items']

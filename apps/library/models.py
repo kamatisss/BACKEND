@@ -49,7 +49,7 @@ class GardenDesign(models.Model):
                                   help_text="{width, length, terrain_type}")
     total_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     terrain_height = models.FloatField(default=1.5)
-    time_of_day = models.IntegerField(default=14)
+    time_of_day = models.FloatField(default=14.0)
     STATUS_CHOICES = [
         ('draft', 'Draft'),
         ('submitted', 'Submitted'),

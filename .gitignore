@@ -7,6 +7,9 @@ __pycache__/
 
 # Database
 db.sqlite3
+*.pyc
+__pycache__/
+media/
 
 # Environment variables
 .env

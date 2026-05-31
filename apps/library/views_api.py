@@ -17,7 +17,6 @@ from .serializers import (
     GardenDesignSerializer,
     GardenDesignListSerializer,
     UserSerializer,
-    UserSerializer,
     CustomTokenObtainPairSerializer,
     BlackoutDateSerializer,
     ServiceBookingSerializer,
@@ -125,6 +124,42 @@ class GardenDesignViewSet(viewsets.ModelViewSet):
             design.save()
             return Response({'status': new_status})
         return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['patch'], url_path='items/(?P<item_id>[^/.]+)')
+    def patch_item(self, request, pk=None, item_id=None):
+        """
+        PATCH /api/designs/:id/items/:item_id/
+        Partially updates a single placed item inside the design's placed_items JSON array.
+        Accepts any subset of: position, rotation, scale.
+        """
+        design = self.get_object()
+        placed = design.placed_items or []
+
+        # Find the item by its client-side id (stored as a number or string)
+        target = None
+        for item in placed:
+            if str(item.get('id')) == str(item_id):
+                target = item
+                break
+
+        if target is None:
+            return Response({'error': f'Item {item_id} not found in design.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Merge only the fields provided
+        allowed_fields = {'position', 'rotation', 'scale', 'rotation_y'}
+        for field, value in request.data.items():
+            if field in allowed_fields:
+                if field == 'rotation_y':
+                    # Convenience: update just the Y axis of rotation
+                    if 'rotation' not in target or not isinstance(target['rotation'], dict):
+                        target['rotation'] = {'x': 0, 'y': 0, 'z': 0}
+                    target['rotation']['y'] = float(value)
+                else:
+                    target[field] = value
+
+        design.placed_items = placed
+        design.save(update_fields=['placed_items', 'updated_at'])
+        return Response({'status': 'updated', 'item': target})
 
 
 class BlackoutDateViewSet(viewsets.ModelViewSet):
@@ -306,3 +341,53 @@ def stripe_webhook(request):
                 pass  # Order deleted mid-session — ignore gracefully
 
     return HttpResponse(status=200)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forgot / Reset Password (no email required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['POST'])
+def reset_password(request):
+    """
+    POST /api/reset-password/
+    Body: { username, email, new_password }
+
+    Verifies that the given username + email match a real account,
+    then updates the password. No email server required.
+    Returns 200 on success, 400 on mismatch or validation error.
+    """
+    username     = request.data.get('username', '').strip()
+    email        = request.data.get('email', '').strip().lower()
+    new_password = request.data.get('new_password', '')
+
+    if not username or not email or not new_password:
+        return Response(
+            {'error': 'username, email, and new_password are all required.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if len(new_password) < 8:
+        return Response(
+            {'error': 'New password must be at least 8 characters.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        user = User.objects.get(username=username)
+    except User.DoesNotExist:
+        # Return the same message as an email mismatch to avoid username enumeration
+        return Response(
+            {'error': 'No account found with that username and email combination.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if user.email.lower() != email:
+        return Response(
+            {'error': 'No account found with that username and email combination.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    user.set_password(new_password)
+    user.save()
+    return Response({'message': 'Password reset successfully. You can now log in.'})
