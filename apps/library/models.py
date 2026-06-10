@@ -96,6 +96,9 @@ class ServiceBooking(models.Model):
     service_type = models.CharField(max_length=50, choices=SERVICE_CHOICES)
     scheduled_date = models.DateField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Pending')
+    contact_number = models.CharField(max_length=20, blank=True, default='')
+    preferred_time = models.CharField(max_length=50, blank=True, default='')
+    service_address = models.TextField(blank=True, default='')
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -112,11 +115,18 @@ class Order(models.Model):
         ('Pending', 'Pending'),
         ('Paid',    'Paid'),
     ]
+    PAYMENT_METHOD_CHOICES = [
+        ('stripe', 'Online Payment (Stripe)'),
+        ('cod',    'Cash on Delivery'),
+    ]
+    user             = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
     customer_name    = models.CharField(max_length=150)
     customer_email   = models.EmailField()
+    customer_phone   = models.CharField(max_length=20, blank=True, default='')
     customer_address = models.TextField()
     booking_date     = models.DateField(null=True, blank=True)
     total_price      = models.DecimalField(max_digits=12, decimal_places=2)
+    payment_method   = models.CharField(max_length=10, choices=PAYMENT_METHOD_CHOICES, default='stripe')
     status           = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Pending')
     created_at       = models.DateTimeField(auto_now_add=True)
 

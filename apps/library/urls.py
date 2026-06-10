@@ -9,7 +9,7 @@ router.register(r'inventory', InventoryItemViewSet)
 router.register(r'designs', GardenDesignViewSet)
 router.register(r'blackout-dates', BlackoutDateViewSet)
 router.register(r'bookings', ServiceBookingViewSet)
-router.register(r'orders', OrderViewSet)
+router.register(r'orders', OrderViewSet, basename='order')
 
 urlpatterns = [
     path('', include(router.urls)),

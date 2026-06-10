@@ -13,15 +13,19 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
 
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=True, style={'input_type': 'password'})
+    first_name = serializers.CharField(required=False, allow_blank=True, default='')
+    last_name = serializers.CharField(required=False, allow_blank=True, default='')
 
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'password')
+        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'password')
 
     def create(self, validated_data):
         user = User.objects.create(
             username=validated_data['username'],
             email=validated_data.get('email', ''),
+            first_name=validated_data.get('first_name', ''),
+            last_name=validated_data.get('last_name', ''),
             is_staff=False,
             is_superuser=False
         )
@@ -85,10 +89,22 @@ class BlackoutDateSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class ServiceBookingSerializer(serializers.ModelSerializer):
+    customer_name = serializers.SerializerMethodField()
+    customer_email = serializers.SerializerMethodField()
+
     class Meta:
         model = ServiceBooking
-        fields = ['id', 'user', 'service_type', 'scheduled_date', 'status', 'notes', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'user', 'created_at', 'updated_at']
+        fields = ['id', 'user', 'customer_name', 'customer_email', 'service_type', 'scheduled_date', 'status', 'contact_number', 'preferred_time', 'service_address', 'notes', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'user', 'customer_name', 'customer_email', 'created_at', 'updated_at']
+
+    def get_customer_name(self, obj):
+        if obj.user:
+            full_name = f"{obj.user.first_name} {obj.user.last_name}".strip()
+            return full_name if full_name else obj.user.username
+        return 'Unknown'
+
+    def get_customer_email(self, obj):
+        return obj.user.email if obj.user else ''
 
     def validate_scheduled_date(self, value):
         if BlackoutDate.objects.filter(date=value).exists():
@@ -107,5 +123,5 @@ class OrderSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Order
-        fields = ['id', 'customer_name', 'customer_email', 'customer_address',
-                  'booking_date', 'total_price', 'status', 'created_at', 'items']
+        fields = ['id', 'customer_name', 'customer_email', 'customer_phone', 'customer_address',
+                  'booking_date', 'total_price', 'payment_method', 'status', 'created_at', 'items']

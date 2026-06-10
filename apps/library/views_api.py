@@ -198,9 +198,20 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
 
 class OrderViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Order.objects.all().order_by('-created_at')
     serializer_class = OrderSerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        # Admins and staff can see all orders
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return Order.objects.all().order_by('-created_at')
+        # Standard users can only see their own orders
+        return Order.objects.filter(user=self.request.user).order_by('-created_at')
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @api_view(['POST'])
@@ -208,16 +219,21 @@ def checkout(request):
     data = request.data
     customer_name = data.get('customer_name')
     customer_email = data.get('customer_email')
+    customer_phone = data.get('customer_phone', '')
     customer_address = data.get('customer_address')
+    payment_method = data.get('payment_method', 'stripe')
     items_data = data.get('items', [])
     total_price = data.get('total_price', 0)
 
     try:
         with transaction.atomic():
             order = Order.objects.create(
+                user=request.user if request.user.is_authenticated else None,
                 customer_name=customer_name,
                 customer_email=customer_email,
+                customer_phone=customer_phone,
                 customer_address=customer_address,
+                payment_method=payment_method,
                 total_price=total_price
             )
 
