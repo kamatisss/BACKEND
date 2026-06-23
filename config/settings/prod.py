@@ -13,6 +13,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://frontend-7zgf.vercel.app",
+    "https://shemireys-backend.up.railway.app",
 ]
 
 # Dynamically add the frontend URL from environment variable if set
