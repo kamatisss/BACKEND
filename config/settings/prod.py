@@ -6,6 +6,11 @@ DEBUG = True # Keep this for your demo
 ALLOWED_HOSTS = ['*']
 CORS_ALLOW_ALL_ORIGINS = True
 
+# --- NEW ADDITION FOR RAILWAY HTTPS PROXY ---
+# Tells Django to trust the X-Forwarded-Proto header from Railway
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+# --------------------------------------------
+
 # Static Files
 STATIC_URL = '/static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
