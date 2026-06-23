@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import InventoryItem, GardenDesign, GardenImage
+from .models import InventoryItem, GardenDesign, GardenImage, Attendance
 
 
 @admin.register(InventoryItem)
@@ -19,3 +19,10 @@ class GardenDesignAdmin(admin.ModelAdmin):
 @admin.register(GardenImage)
 class GardenImageAdmin(admin.ModelAdmin):
     list_display = ['pk', 'uploaded_at']
+
+
+@admin.register(Attendance)
+class AttendanceAdmin(admin.ModelAdmin):
+    list_display = ['staff', 'booking', 'clock_in_time', 'clock_out_time', 'latitude', 'longitude']
+    list_filter = ['clock_in_time', 'staff']
+    search_fields = ['staff__username', 'booking__service_type']

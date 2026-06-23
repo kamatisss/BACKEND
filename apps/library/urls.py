@@ -2,7 +2,7 @@ from django.urls import path, include
 from rest_framework import routers
 
 from .views import generate_depth
-from .views_api import InventoryItemViewSet, GardenDesignViewSet, RegisterView, BlackoutDateViewSet, ServiceBookingViewSet, checkout, OrderViewSet, create_checkout_session, stripe_webhook, reset_password
+from .views_api import InventoryItemViewSet, GardenDesignViewSet, RegisterView, BlackoutDateViewSet, ServiceBookingViewSet, checkout, OrderViewSet, create_checkout_session, stripe_webhook, reset_password, UserViewSet, AttendanceViewSet
 
 router = routers.DefaultRouter()
 router.register(r'inventory', InventoryItemViewSet)
@@ -10,6 +10,8 @@ router.register(r'designs', GardenDesignViewSet)
 router.register(r'blackout-dates', BlackoutDateViewSet)
 router.register(r'bookings', ServiceBookingViewSet)
 router.register(r'orders', OrderViewSet, basename='order')
+router.register(r'users', UserViewSet, basename='user')
+router.register(r'attendance', AttendanceViewSet, basename='attendance')
 
 urlpatterns = [
     path('', include(router.urls)),

@@ -11,7 +11,7 @@ from django.contrib.auth.models import User
 from django.db import transaction
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import InventoryItem, GardenDesign, BlackoutDate, ServiceBooking, Order, OrderItem
+from .models import InventoryItem, GardenDesign, BlackoutDate, ServiceBooking, Order, OrderItem, Attendance
 from .serializers import (
     InventoryItemSerializer,
     GardenDesignSerializer,
@@ -21,6 +21,8 @@ from .serializers import (
     BlackoutDateSerializer,
     ServiceBookingSerializer,
     OrderSerializer,
+    ManageUserSerializer,
+    AttendanceSerializer,
 )
 
 class CustomTokenObtainPairView(TokenObtainPairView):
@@ -185,7 +187,16 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         return ServiceBooking.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        design_id = self.request.data.get('design_id') or self.request.data.get('design')
+        if design_id:
+            try:
+                from .models import GardenDesign
+                design = GardenDesign.objects.get(id=design_id)
+                serializer.save(user=self.request.user, design=design)
+            except Exception:
+                serializer.save(user=self.request.user)
+        else:
+            serializer.save(user=self.request.user)
 
     @action(detail=True, methods=['patch'], permission_classes=[IsAdminUser])
     def update_status(self, request, pk=None):
@@ -212,6 +223,40 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         instance = self.get_object()
         instance.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['patch'], permission_classes=[IsAuthenticated])
+    def update_status(self, request, pk=None):
+        order = self.get_object()
+        new_status = request.data.get('status')
+        new_payment_status = request.data.get('payment_status')
+
+        if not (request.user.is_staff or request.user.is_superuser):
+            return Response({'error': 'Unauthorized'}, status=status.HTTP_403_FORBIDDEN)
+
+        if new_status:
+            # Map common variants like 'shipped', 'out_for_delivery', 'delivered', 'cancelled' to capitalized choices
+            normalized_status = new_status
+            if new_status == 'shipped':
+                normalized_status = 'Shipped'
+            elif new_status == 'out_for_delivery':
+                normalized_status = 'Out for Delivery'
+            elif new_status == 'delivered':
+                normalized_status = 'Delivered'
+            elif new_status == 'cancelled':
+                normalized_status = 'Cancelled'
+
+            if normalized_status in dict(Order.STATUS_CHOICES):
+                order.status = normalized_status
+                if normalized_status == 'Delivered' and order.payment_method == 'cod':
+                    order.payment_status = 'Paid'
+            else:
+                return Response({'error': f'Invalid status: {new_status}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if new_payment_status:
+            order.payment_status = new_payment_status
+
+        order.save()
+        return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
 
 @api_view(['POST'])
@@ -407,3 +452,166 @@ def reset_password(request):
     user.set_password(new_password)
     user.save()
     return Response({'message': 'Password reset successfully. You can now log in.'})
+
+
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all().order_by('-date_joined')
+    serializer_class = ManageUserSerializer
+    
+    def get_permissions(self):
+        from rest_framework.permissions import BasePermission
+        
+        class IsSuperUser(BasePermission):
+            def has_permission(self, request, view):
+                return bool(request.user and request.user.is_superuser)
+        
+        self.permission_classes = [IsSuperUser]
+        return super().get_permissions()
+
+
+class AttendanceViewSet(viewsets.ModelViewSet):
+    serializer_class = AttendanceSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        from rest_framework.permissions import BasePermission
+        class IsStaffOrAdmin(BasePermission):
+            def has_permission(self, request, view):
+                return bool(request.user and request.user.is_authenticated and (request.user.is_staff or request.user.is_superuser))
+        self.permission_classes = [IsStaffOrAdmin]
+        return super().get_permissions()
+
+    def get_queryset(self):
+        if self.request.user.is_superuser:
+            return Attendance.objects.all().order_by('-clock_in_time')
+        return Attendance.objects.filter(staff=self.request.user).order_by('-clock_in_time')
+
+    @action(detail=False, methods=['get'])
+    def current(self, request):
+        """GET /api/attendance/current/ - Get the active clock-in session of the staff member"""
+        active_session = Attendance.objects.filter(staff=request.user, clock_out_time__isnull=True).first()
+        if active_session:
+            return Response({
+                'clocked_in': True,
+                'attendance': AttendanceSerializer(active_session, context={'request': request}).data
+            })
+        return Response({
+            'clocked_in': False,
+            'attendance': None
+        })
+
+    @action(detail=False, methods=['post'])
+    def clock_in(self, request):
+        """POST /api/attendance/clock_in/"""
+        from django.utils import timezone
+        import base64
+        from django.core.files.base import ContentFile
+
+        user = request.user
+        if Attendance.objects.filter(staff=user, clock_out_time__isnull=True).exists():
+            return Response({'error': 'You are already clocked in. Please clock out first.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        booking_id = request.data.get('booking_id')
+        latitude = request.data.get('latitude')
+        longitude = request.data.get('longitude')
+        address = request.data.get('address') or request.data.get('clock_in_address')
+        photo_data = request.data.get('photo') or request.data.get('clock_in_photo_url')
+
+        try:
+            latitude = float(latitude) if latitude is not None else None
+            longitude = float(longitude) if longitude is not None else None
+        except (ValueError, TypeError):
+            latitude = None
+            longitude = None
+
+        try:
+            with transaction.atomic():
+                attendance = Attendance(
+                    staff=user,
+                    booking_id=booking_id,
+                    clock_in_time=timezone.now(),
+                    latitude=latitude,
+                    longitude=longitude,
+                    clock_in_address=address
+                )
+
+                if photo_data:
+                    if isinstance(photo_data, str) and photo_data.startswith('data:image'):
+                        try:
+                            format, imgstr = photo_data.split(';base64,')
+                            ext = format.split('/')[-1].split(';')[0]
+                            filename = f"clock_in_{user.id}_{int(timezone.now().timestamp())}.{ext}"
+                            attendance.clock_in_photo_url.save(filename, ContentFile(base64.b64decode(imgstr)), save=False)
+                        except Exception as e:
+                            return Response({'error': f'Failed to decode image: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+                    elif hasattr(photo_data, 'read'):
+                        attendance.clock_in_photo_url = photo_data
+
+                attendance.save()
+
+                if booking_id:
+                    try:
+                        booking = ServiceBooking.objects.get(id=booking_id)
+                        booking.status = 'In Progress'
+                        booking.save()
+                    except ServiceBooking.DoesNotExist:
+                        pass
+        except Exception as e:
+            return Response({'error': f'Transaction failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(AttendanceSerializer(attendance, context={'request': request}).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
+    def clock_out(self, request):
+        """POST /api/attendance/clock_out/"""
+        from django.utils import timezone
+        import base64
+        from django.core.files.base import ContentFile
+
+        user = request.user
+        active_session = Attendance.objects.filter(staff=user, clock_out_time__isnull=True).first()
+        if not active_session:
+            return Response({'error': 'No active clock-in session found. Please clock in first.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        latitude = request.data.get('latitude')
+        longitude = request.data.get('longitude')
+        address = request.data.get('address') or request.data.get('clock_out_address')
+        photo_data = request.data.get('photo') or request.data.get('clock_out_photo_url')
+
+        try:
+            with transaction.atomic():
+                try:
+                    if latitude is not None:
+                        active_session.latitude = float(latitude)
+                    if longitude is not None:
+                        active_session.longitude = float(longitude)
+                except (ValueError, TypeError):
+                    pass
+
+                active_session.clock_out_time = timezone.now()
+                active_session.clock_out_address = address
+
+                if photo_data:
+                    if isinstance(photo_data, str) and photo_data.startswith('data:image'):
+                        try:
+                            format, imgstr = photo_data.split(';base64,')
+                            ext = format.split('/')[-1].split(';')[0]
+                            filename = f"clock_out_{user.id}_{int(timezone.now().timestamp())}.{ext}"
+                            active_session.clock_out_photo_url.save(filename, ContentFile(base64.b64decode(imgstr)), save=False)
+                        except Exception as e:
+                            return Response({'error': f'Failed to decode image: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+                    elif hasattr(photo_data, 'read'):
+                        active_session.clock_out_photo_url = photo_data
+
+                active_session.save()
+
+                if active_session.booking:
+                    booking = active_session.booking
+                    booking.status = 'Completed'
+                    booking.save()
+
+        except Exception as e:
+            return Response({'error': f'Transaction failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(AttendanceSerializer(active_session, context={'request': request}).data, status=status.HTTP_200_OK)
+

@@ -18,30 +18,62 @@ logger = logging.getLogger(__name__)
 # ───────────────────────────────────────────────────────────────
 _midas_model = None
 _midas_transform = None
+_device = None
+_load_lock = False
 
 def _load_midas():
-    global _midas_model, _midas_transform
+    global _midas_model, _midas_transform, _device, _load_lock
     if _midas_model is not None:
         return True
+    if _load_lock:
+        # Wait a bit if it's currently loading in another thread
+        import time
+        for _ in range(50):
+            if _midas_model is not None:
+                return True
+            time.sleep(0.1)
+        if _midas_model is not None:
+            return True
+            
+    _load_lock = True
     try:
         import torch
-        _midas_model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
-        _midas_model.eval()
+        import os
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        torch.hub.set_dir(os.path.join(base_dir, '.cache', 'torch', 'hub'))
+        
+        _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Load the model and move it to the correct device
+        model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+        model.to(_device)
+        model.eval()
+        
         _midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True).small_transform
-        logger.info("MiDaS loaded")
+        _midas_model = model
+        logger.info(f"MiDaS loaded successfully on {_device}")
+        _load_lock = False
         return True
-    except Exception:
+    except Exception as e:
+        logger.error(f"Failed to load MiDaS: {e}")
+        _load_lock = False
         return False
 
 def _midas_depth(img_uint8):
     import torch
-    batch = _midas_transform(img_uint8)
+    global _midas_model, _midas_transform, _device
+    
+    # Move the input batch to the correct device
+    batch = _midas_transform(img_uint8).to(_device)
+    
     with torch.no_grad():
         pred = _midas_model(batch)
         pred = torch.nn.functional.interpolate(
             pred.unsqueeze(1), size=img_uint8.shape[:2],
             mode="bicubic", align_corners=False
         ).squeeze()
+        
+    # Move prediction back to CPU before converting to numpy
     d = pred.cpu().numpy()
     d = (d - d.min()) / (d.max() - d.min() + 1e-8)
     return d.astype(np.float32)
@@ -294,7 +326,11 @@ def generate_depth(request):
         # ═══ LOAD ═══
         img = Image.open(image_file).convert('RGB')
         original_size = img.size
-        img = img.resize((512, 512), Image.Resampling.LANCZOS)
+        
+        # Use BILINEAR instead of LANCZOS for significantly faster resizing,
+        # especially important for large phone camera photos
+        img = img.resize((512, 512), Image.Resampling.BILINEAR)
+        
         img_uint8 = np.array(img, dtype=np.uint8)
         img_np = img_uint8.astype(np.float32) / 255.0
         gray = np.array(img.convert('L'), dtype=np.float32) / 255.0
@@ -346,7 +382,9 @@ def generate_depth(request):
             ('object_mask', _to_pil_gray((object_mask > 0).astype(np.float32))),
         ]:
             buf = BytesIO()
-            pil_img.save(buf, format='PNG', optimize=True)
+            # optimize=True is extremely slow (uses zlib multi-pass).
+            # compress_level=1 is the fastest compression.
+            pil_img.save(buf, format='PNG', compress_level=1)
             buf.seek(0)
             path = default_storage.save(f'depth_maps/{name}_{base}_{ts}.png', buf)
             results[f'{name}_url'] = f'/media/{path}'

@@ -1,13 +1,18 @@
 import torch
 import cv2
 import numpy as np
+import os
+
+# Set local cache directory for torch
+base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+torch.hub.set_dir(os.path.join(base_dir, '.cache', 'torch', 'hub'))
 
 # Load model once
 model_type = "MiDaS_small"
-midas = torch.hub.load("intel-isl/MiDaS", model_type)
+midas = torch.hub.load("intel-isl/MiDaS", model_type, trust_repo=True)
 midas.eval()
 
-transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+transform = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True).small_transform
 
 
 def generate_depth_map(input_path, output_path):

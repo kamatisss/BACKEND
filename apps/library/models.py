@@ -88,6 +88,7 @@ class ServiceBooking(models.Model):
     STATUS_CHOICES = [
         ('Pending', 'Pending'),
         ('Confirmed', 'Confirmed'),
+        ('In Progress', 'In Progress'),
         ('Completed', 'Completed'),
         ('Cancelled', 'Cancelled'),
     ]
@@ -100,6 +101,7 @@ class ServiceBooking(models.Model):
     preferred_time = models.CharField(max_length=50, blank=True, default='')
     service_address = models.TextField(blank=True, default='')
     notes = models.TextField(blank=True)
+    design = models.ForeignKey('GardenDesign', on_delete=models.SET_NULL, null=True, blank=True, related_name='bookings')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -114,6 +116,10 @@ class Order(models.Model):
     STATUS_CHOICES = [
         ('Pending', 'Pending'),
         ('Paid',    'Paid'),
+        ('Shipped', 'Shipped'),
+        ('Out for Delivery', 'Out for Delivery'),
+        ('Delivered', 'Delivered'),
+        ('Cancelled', 'Cancelled'),
     ]
     PAYMENT_METHOD_CHOICES = [
         ('stripe', 'Online Payment (Stripe)'),
@@ -128,6 +134,7 @@ class Order(models.Model):
     total_price      = models.DecimalField(max_digits=12, decimal_places=2)
     payment_method   = models.CharField(max_length=10, choices=PAYMENT_METHOD_CHOICES, default='stripe')
     status           = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Pending')
+    payment_status   = models.CharField(max_length=20, default='Pending')
     created_at       = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -143,3 +150,29 @@ class OrderItem(models.Model):
     def __str__(self):
         item_name = self.item.name if self.item else "Deleted Item"
         return f"{self.quantity}x {item_name} (Order #{self.order.pk})"
+
+
+class Attendance(models.Model):
+    staff = models.ForeignKey(User, on_delete=models.CASCADE, related_name='attendances')
+    booking = models.ForeignKey(ServiceBooking, on_delete=models.SET_NULL, null=True, blank=True, related_name='attendances')
+    clock_in_time = models.DateTimeField(null=True, blank=True)
+    clock_out_time = models.DateTimeField(null=True, blank=True)
+    clock_in_photo_url = models.ImageField(upload_to='attendance_proofs/', null=True, blank=True)
+    clock_out_photo_url = models.ImageField(upload_to='attendance_proofs/', null=True, blank=True)
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+    clock_in_address = models.CharField(max_length=500, null=True, blank=True)
+    clock_out_address = models.CharField(max_length=500, null=True, blank=True)
+
+    class Meta:
+        ordering = ['-clock_in_time']
+
+    @property
+    def total_hours(self):
+        if self.clock_in_time and self.clock_out_time:
+            duration = self.clock_out_time - self.clock_in_time
+            return round(duration.total_seconds() / 3600.0, 2)
+        return None
+
+    def __str__(self):
+        return f"Attendance for {self.staff.username} on {self.clock_in_time}"
