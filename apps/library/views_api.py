@@ -468,6 +468,72 @@ class UserViewSet(viewsets.ModelViewSet):
         self.permission_classes = [IsSuperUser]
         return super().get_permissions()
 
+    @action(detail=True, methods=['get'])
+    def activity_log(self, request, pk=None):
+        """
+        GET /api/users/:id/activity_log/
+        Returns chronological log of recent customer/staff actions.
+        """
+        user = self.get_object()
+        
+        role = 'Customer'
+        if user.is_superuser:
+            role = 'Admin'
+        elif user.is_staff:
+            role = 'Staff'
+            
+        logs = []
+        
+        if role == 'Staff':
+            attendances = Attendance.objects.filter(staff=user).order_by('-clock_in_time')[:10]
+            for att in attendances:
+                if att.clock_in_time:
+                    logs.append({
+                        'type': 'clock_in',
+                        'timestamp': att.clock_in_time.isoformat(),
+                        'details': f"Clocked in at {att.clock_in_address or 'Unknown location'}",
+                        'booking_id': att.booking_id,
+                        'booking_type': att.booking.service_type if att.booking else None
+                    })
+                if att.clock_out_time:
+                    logs.append({
+                        'type': 'clock_out',
+                        'timestamp': att.clock_out_time.isoformat(),
+                        'details': f"Clocked out at {att.clock_out_address or 'Unknown location'} (Total Hours: {att.total_hours})",
+                        'booking_id': att.booking_id,
+                        'booking_type': att.booking.service_type if att.booking else None
+                    })
+        else:
+            # Customer bookings
+            bookings = ServiceBooking.objects.filter(user=user).order_by('-created_at')[:10]
+            for b in bookings:
+                logs.append({
+                    'type': 'booking',
+                    'timestamp': b.created_at.isoformat() if b.created_at else None,
+                    'details': f"Service Booking #{b.id} ({b.service_type}) - Status: {b.status} (Scheduled: {b.scheduled_date})",
+                    'id': b.id
+                })
+            # Customer orders
+            orders = Order.objects.filter(user=user).order_by('-created_at')[:10]
+            for o in orders:
+                logs.append({
+                    'type': 'order',
+                    'timestamp': o.created_at.isoformat() if o.created_at else None,
+                    'details': f"Order #{o.id} - Total: ₱{o.total_price:,.2f} - Status: {o.status} - Payment: {o.payment_status}",
+                    'id': o.id
+                })
+                
+        # Sort logs by timestamp descending
+        logs.sort(key=lambda x: x['timestamp'] or '', reverse=True)
+        
+        return Response({
+            'user_id': user.id,
+            'username': user.username,
+            'role': role,
+            'activity_logs': logs
+        })
+
+
 
 class AttendanceViewSet(viewsets.ModelViewSet):
     serializer_class = AttendanceSerializer

@@ -56,3 +56,4 @@ typer
 typing_extensions
 tzdata
 urllib3
+psycopg2-binary
