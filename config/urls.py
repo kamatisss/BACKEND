@@ -18,14 +18,28 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from django.http import JsonResponse
 from rest_framework_simplejwt.views import TokenRefreshView
 from apps.library.views_api import CustomTokenObtainPairView
 
+def api_root(request):
+    return JsonResponse({
+        "message": "Welcome to the Capstone Backend API",
+        "status": "healthy",
+        "endpoints": {
+            "admin": "/admin/",
+            "api": "/api/",
+            "token_obtain": "/api/token/",
+            "token_refresh": "/api/token/refresh/"
+        }
+    })
+
 urlpatterns = [
+    path('', api_root, name='api-root'),
     path('admin/', admin.site.urls),
     path('api/token/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('api/', include('apps.library.urls')),
 ]
 if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

@@ -14,6 +14,7 @@ djangorestframework_simplejwt
 filelock
 fonttools
 fsspec
+gunicorn
 h11
 hf-xet
 httpcore
@@ -32,6 +33,7 @@ numpy
 opencv-python-headless
 packaging
 pillow
+psycopg2-binary
 Pygments
 PyJWT
 pyparsing
