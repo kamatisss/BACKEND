@@ -60,3 +60,4 @@ tzdata
 urllib3
 psycopg2-binary
 gunicorn
+dj-database-url
