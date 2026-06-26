@@ -45,7 +45,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventoryItem
         fields = ['id', 'name', 'category', 'description', 'stock_quantity',
-                  'unit_price', 'image_url', 'model_file', 'thumbnail']
+                  'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size']
 
     def get_model_file(self, obj):
         request = self.context.get('request')
@@ -83,9 +83,17 @@ class GardenDesignSerializer(serializers.ModelSerializer):
 
 class GardenDesignListSerializer(serializers.ModelSerializer):
     """Lighter serializer for list views (no placed_items blob)."""
+    customer_name = serializers.SerializerMethodField()
+
     class Meta:
         model = GardenDesign
-        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at']
+        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at', 'dimensions', 'original_image_url', 'customer_name']
+
+    def get_customer_name(self, obj):
+        if obj.user:
+            full_name = f"{obj.user.first_name} {obj.user.last_name}".strip()
+            return full_name if full_name else obj.user.username
+        return 'Anonymous'
 
 class BlackoutDateSerializer(serializers.ModelSerializer):
     class Meta:

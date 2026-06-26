@@ -61,3 +61,5 @@ urllib3
 psycopg2-binary
 gunicorn
 dj-database-url
+google-genai
+pydantic

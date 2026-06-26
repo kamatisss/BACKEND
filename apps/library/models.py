@@ -15,6 +15,7 @@ class InventoryItem(models.Model):
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)
     image_url = models.CharField(max_length=500, blank=True)
     model_file = models.FileField(upload_to='models/', null=True, blank=True)
+    real_world_size = models.FloatField(default=1.0, help_text="Target size/height of the model in meters")
     thumbnail = models.ImageField(upload_to='thumbnails/', null=True, blank=True)
 
     class Meta:

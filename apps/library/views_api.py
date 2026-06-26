@@ -1,6 +1,19 @@
 import stripe
+import os
+import json
+import logging
+import time
+from asgiref.sync import async_to_sync, sync_to_async
+from rest_framework.views import APIView
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+from pydantic import BaseModel, Field
+from typing import List
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
+
+logger = logging.getLogger(__name__)
 from django.http import HttpResponse
 
 from rest_framework import viewsets, status, generics
@@ -680,4 +693,298 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             return Response({'error': f'Transaction failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return Response(AttendanceSerializer(active_session, context={'request': request}).data, status=status.HTTP_200_OK)
+
+
+# ───────────────────────────────────────────────────────────────
+# MOCK PLANT CATALOG & GEMINI GENERATION VIEW
+# ───────────────────────────────────────────────────────────────
+
+MOCK_PLANT_CATALOG = [
+    {"id": "tree_oak", "name": "Oak Tree", "price": 1200},
+    {"id": "flower_rose", "name": "Rose Flower", "price": 150},
+    {"id": "shrub_fern", "name": "Fern Shrub", "price": 250},
+    {"id": "tree_palm", "name": "Palm Tree", "price": 800},
+    {"id": "flower_lavender", "name": "Lavender Flower", "price": 180},
+    {"id": "shrub_boxwood", "name": "Boxwood Shrub", "price": 300},
+    {"id": "plant_bamboo", "name": "Bamboo Plant", "price": 450},
+    {"id": "plant_banana", "name": "Banana Plant", "price": 350},
+]
+
+class PlantArrangement(BaseModel):
+    plant_id: str
+    x: float
+    z: float
+    rotation: float
+
+class GardenDesignSchema(BaseModel):
+    design_name: str
+    total_cost: int
+    plants: List[PlantArrangement]
+
+class LayoutResponse(BaseModel):
+    designs: List[GardenDesignSchema]
+
+
+class GenerateLayoutsView(APIView):
+    """
+    POST /api/generate-layouts/
+    Accepts:
+    - budget: int (required)
+    - preferred_plant_ids: list of str (optional)
+    
+    Generates 3 distinct garden design options using Gemini 2.5.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        # 1. Parse request body
+        try:
+            data = request.data
+        except Exception:
+            return Response(
+                {"error": "Invalid request body. Expected JSON or multipart/form-data."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        budget = data.get("budget")
+        lot_width = data.get("lot_width")
+        lot_length = data.get("lot_length")
+        preferred_plant_ids_raw = data.get("preferred_plant_ids", [])
+
+        # 2. Validate inputs
+        if budget is None:
+            return Response(
+                {"error": "Budget is a required field."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if lot_width is None:
+            return Response(
+                {"error": "Lot width (lot_width) is a required field."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if lot_length is None:
+            return Response(
+                {"error": "Lot length (lot_length) is a required field."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            budget_int = int(budget)
+            if budget_int <= 0:
+                raise ValueError()
+        except (ValueError, TypeError):
+            return Response(
+                {"error": "Budget must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            lot_width_float = float(lot_width)
+            lot_length_float = float(lot_length)
+            if lot_width_float <= 0.0 or lot_length_float <= 0.0:
+                raise ValueError()
+        except (ValueError, TypeError):
+            return Response(
+                {"error": "Lot width and lot length must be positive numbers."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Parse preferred_plant_ids (could be stringified JSON array if multipart)
+        preferred_plant_ids = []
+        if preferred_plant_ids_raw:
+            if isinstance(preferred_plant_ids_raw, str):
+                try:
+                    preferred_plant_ids = json.loads(preferred_plant_ids_raw)
+                except Exception:
+                    return Response(
+                        {"error": "preferred_plant_ids must be a valid JSON array string."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            elif isinstance(preferred_plant_ids_raw, list):
+                preferred_plant_ids = preferred_plant_ids_raw
+            else:
+                return Response(
+                    {"error": "preferred_plant_ids must be a list or a JSON array string."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Extract optional image
+        image_file = request.FILES.get('image')
+        image_part = None
+        existing_elements = []
+        if image_file:
+            try:
+                # 3. Import and call the Vision pre-pass scan function
+                from .utils import scan_image_for_existing_elements
+                existing_elements = async_to_sync(scan_image_for_existing_elements)(image_file)
+
+                # Re-read and build the image part for layout generation
+                image_bytes = image_file.read()
+                image_file.seek(0) # reset stream
+                image_part = types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=image_file.content_type
+                )
+            except Exception as e:
+                logger.exception("Failed to read uploaded image file.")
+                return Response(
+                    {"error": f"Failed to process uploaded image: {str(e)}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # 3. Check for Gemini API key
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key or api_key == "your_gemini_api_key_here":
+            logger.error("GEMINI_API_KEY is not configured or is the default placeholder in environment.")
+            return Response(
+                {"error": "Gemini API key is not configured on the server. Please check environment configuration."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+
+        # 4. Construct client and prompt
+        try:
+            client = genai.Client()
+        except Exception as e:
+            logger.exception("Failed to initialize GenAI client.")
+            return Response(
+                {"error": f"Failed to initialize AI Client: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        # Update system instruction to enforce occupied boundaries
+        existing_elements_str = json.dumps(existing_elements)
+        system_instruction = (
+            "You are an expert landscape architect. When an image is provided, your primary goal is spatial site analysis.\n"
+            "- Identify existing hardscapes, walls, and structures in the provided image.\n"
+            "- You MUST constrain your layout coordinates (x, z) to avoid placing plants on top of these identified structures.\n"
+            "- Treat the reference photo as a site map. If the photo shows a patio in the center, do not place flora there.\n"
+            "- If no image is provided, you may default to a balanced, symmetrical design.\n\n"
+            f"CRITICAL SPATIAL CONSTRAINT: The user already has structural elements/plants in their yard at the following coordinates:\n"
+            f"{existing_elements_str}\n\n"
+            "You MUST treat these coordinates as occupied boundaries. Do not place any new database inventory items within a 2.0-meter radius of any existing item's coordinate pair. Your newly generated items must occupy the remaining empty space on the grid.\n\n"
+            "Your job is to select plants from the provided catalog that fit within the user's budget constraints and "
+            "generate exactly 3 distinct garden design layout styles (e.g., Symmetrical, Minimalist, Lush/Organic). "
+            "For each design, layout the selected plants logically across a coordinate grid defined by the user's lot dimensions. "
+            "All plants in the design must have X coordinates mapped between 0.0 and the lot width, "
+            "and Z coordinates mapped between 0.0 and the lot length. "
+            "The Y-axis rotation must be between 0.0 and 360.0 degrees. "
+            "The total_cost of all placed plants in a layout must not exceed the user's specified budget. "
+            "Ensure that the designs are distinct and creative."
+        )
+
+        photo_emphasis = ""
+        if image_part:
+            photo_emphasis = (
+                "\nAnalyze the attached reference photo carefully as a site plan. Map the flora arrangement to the "
+                "available, empty ground space visible in the photo.\n"
+            )
+
+        # Query plant inventory from database
+        available_plants = list(InventoryItem.objects.filter(category='plant'))
+        
+        # Build text-based catalog for the prompt
+        catalog_text = ""
+        for plant in available_plants:
+            desc = f" ({plant.description})" if plant.description else ""
+            catalog_text += f"- ID: '{plant.id}', Name: '{plant.name}', Cost: {int(plant.unit_price)} PHP{desc}\n"
+
+        user_prompt = f"""
+Provided Plant Catalog:
+{catalog_text}
+
+User Budget & Lot Constraints:
+Budget: ₱{budget_int}
+Lot Width (X-axis max): {lot_width_float} meters
+Lot Length (Z-axis max): {lot_length_float} meters
+Preferred Plant IDs: {json.dumps(preferred_plant_ids)}
+{photo_emphasis}
+Please generate exactly 3 distinct GardenDesign layout options based on this catalog, budget, lot dimensions, and preferences.
+The plant_id field in your response for each plant MUST be the database ID (integer string) of the chosen plant from the provided catalog.
+"""
+        if image_part:
+            contents = [image_part, user_prompt]
+        else:
+            contents = user_prompt
+
+        # 5. Call Gemini with retry logic for transient 503/overload errors
+        MAX_RETRIES = 3
+        last_error = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = async_to_sync(client.aio.models.generate_content)(
+                    model='gemini-2.5-flash',
+                    contents=contents,
+                    config={
+                        "system_instruction": system_instruction,
+                        "response_mime_type": "application/json",
+                        "response_schema": LayoutResponse,
+                        "temperature": 0.2
+                    }
+                )
+                last_error = None
+                break  # success — exit retry loop
+
+            except APIError as e:
+                last_error = e
+                error_str = str(e)
+                is_retryable = '503' in error_str or 'UNAVAILABLE' in error_str or '429' in error_str
+                if is_retryable and attempt < MAX_RETRIES - 1:
+                    wait = 2 ** attempt  # 1 s, 2 s
+                    logger.warning("Gemini transient error (attempt %d/%d), retrying in %ds: %s",
+                                   attempt + 1, MAX_RETRIES, wait, error_str)
+                    time.sleep(wait)
+                    continue
+                # Non-retryable or final attempt — fall through to error response
+                break
+
+            except Exception as e:
+                logger.exception("Unexpected error during Gemini call.")
+                return Response(
+                    {"error": "An unexpected error occurred while generating layouts. Please try again."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+        if last_error is not None:
+            error_str = str(last_error)
+            if '503' in error_str or 'UNAVAILABLE' in error_str:
+                user_msg = "The AI service is temporarily overloaded. Please wait a moment and try again."
+            elif '429' in error_str:
+                user_msg = "Too many requests to the AI service. Please wait a moment and try again."
+            else:
+                user_msg = "The AI service returned an error. Please try again."
+            logger.error("Gemini API failed after %d attempts: %s", MAX_RETRIES, error_str)
+            return Response({"error": user_msg}, status=status.HTTP_502_BAD_GATEWAY)
+
+        # 6. Parse result
+        try:
+            if hasattr(response, 'parsed') and response.parsed is not None:
+                response_data = response.parsed.model_dump()
+            else:
+                response_data = json.loads(response.text)
+        except Exception as e:
+            logger.exception("Failed to parse Gemini response.")
+            return Response(
+                {"error": "Received an unreadable response from the AI service. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+
+        # Merge existing elements into each design's plant list
+        if isinstance(response_data, dict) and "designs" in response_data:
+            for design in response_data["designs"]:
+                if "plants" not in design or not isinstance(design["plants"], list):
+                    design["plants"] = []
+
+                for elem in existing_elements:
+                    merged_item = dict(elem)
+                    # Map type to plant_id if missing to prevent frontend JS errors
+                    if "plant_id" not in merged_item and "type" in merged_item:
+                        merged_item["plant_id"] = merged_item["type"]
+                    merged_item["is_existing"] = True
+                    if "rotation" not in merged_item:
+                        merged_item["rotation"] = 0.0
+                    design["plants"].append(merged_item)
+
+        return Response(response_data, status=status.HTTP_200_OK)
+
 
