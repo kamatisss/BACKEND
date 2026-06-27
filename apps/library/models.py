@@ -42,6 +42,10 @@ class GardenDesign(models.Model):
     name = models.CharField(max_length=100, default='Untitled Design')
     garden_image = models.ForeignKey(GardenImage, on_delete=models.SET_NULL, null=True, blank=True)
     original_image_url = models.CharField(max_length=500, blank=True)
+    reference_image_url = models.CharField(
+        max_length=1000, blank=True, default='',
+        help_text="Garden background photo URL used for AR overlay in staff preview"
+    )
     depth_data = models.JSONField(default=dict, blank=True,
                                   help_text="Stores depth/normal/mask URLs")
     placed_items = models.JSONField(default=list,

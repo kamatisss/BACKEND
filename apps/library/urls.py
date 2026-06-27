@@ -6,7 +6,7 @@ from .views_api import (
     InventoryItemViewSet, GardenDesignViewSet, RegisterView, BlackoutDateViewSet,
     ServiceBookingViewSet, checkout, OrderViewSet, create_checkout_session,
     stripe_webhook, reset_password, UserViewSet, AttendanceViewSet,
-    GenerateLayoutsView
+    GenerateLayoutsView, upload_design_image
 )
 
 router = routers.DefaultRouter()
@@ -27,4 +27,5 @@ urlpatterns = [
     path('create-checkout-session/', create_checkout_session, name='create_checkout_session'),
     path('stripe-webhook/', stripe_webhook, name='stripe_webhook'),
     path('reset-password/', reset_password, name='reset_password'),
+    path('upload-design-image/', upload_design_image, name='upload_design_image'),
 ]

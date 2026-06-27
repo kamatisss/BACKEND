@@ -7,14 +7,14 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-async def scan_image_for_existing_elements(image_file):
+def scan_image_for_existing_elements(image_file):
     """
-    Asynchronously scans an uploaded garden reference photo to identify existing elements
+    Scans an uploaded garden reference photo to identify existing elements
     (e.g., trees, bushes, rocks) and estimate their 3D coordinates and scale.
-    
+
     Args:
         image_file: Django uploaded file (or file-like object/bytes) representing the image.
-        
+
     Returns:
         list of dicts matching the Vision AI schema, or [] on failure.
     """
@@ -75,8 +75,8 @@ async def scan_image_for_existing_elements(image_file):
             "]"
         )
 
-        # Make the Vision API call asynchronously
-        response = await client.aio.models.generate_content(
+        # Make the Vision API call synchronously
+        response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[
                 image_part,

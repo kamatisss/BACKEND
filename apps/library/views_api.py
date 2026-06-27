@@ -3,7 +3,6 @@ import os
 import json
 import logging
 import time
-from asgiref.sync import async_to_sync, sync_to_async
 from rest_framework.views import APIView
 from google import genai
 from google.genai import types
@@ -196,8 +195,8 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         if self.request.user.is_staff or self.request.user.is_superuser:
-            return ServiceBooking.objects.all()
-        return ServiceBooking.objects.filter(user=self.request.user)
+            return ServiceBooking.objects.select_related('design', 'design__garden_image').all()
+        return ServiceBooking.objects.filter(user=self.request.user).select_related('design', 'design__garden_image')
 
     def perform_create(self, serializer):
         design_id = self.request.data.get('design_id') or self.request.data.get('design')
@@ -420,6 +419,31 @@ def stripe_webhook(request):
 # ─────────────────────────────────────────────────────────────────────────────
 # Forgot / Reset Password (no email required)
 # ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['POST'])
+def upload_design_image(request):
+    """
+    POST /api/upload-design-image/
+    Accepts a single image file, saves it to media/design_refs/, and returns its absolute URL.
+    Used by the AI Designer to persist the garden background photo before creating a GardenDesign.
+    """
+    if not request.user or not request.user.is_authenticated:
+        return Response({'error': 'Authentication required.'}, status=status.HTTP_401_UNAUTHORIZED)
+    if 'image' not in request.FILES:
+        return Response({'error': 'No image provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    image_file = request.FILES['image']
+    from django.core.files.storage import default_storage
+    from django.conf import settings as django_settings
+
+    ext = os.path.splitext(image_file.name)[1] or '.jpg'
+    filename = f"design_refs/ref_{int(time.time())}{ext}"
+    saved_path = default_storage.save(filename, image_file)
+
+    media_url = getattr(django_settings, 'MEDIA_URL', '/media/').rstrip('/')
+    url = request.build_absolute_uri(f'{media_url}/{saved_path}')
+    return Response({'url': url}, status=status.HTTP_201_CREATED)
+
 
 @api_view(['POST'])
 def reset_password(request):
@@ -816,7 +840,7 @@ class GenerateLayoutsView(APIView):
             try:
                 # 3. Import and call the Vision pre-pass scan function
                 from .utils import scan_image_for_existing_elements
-                existing_elements = async_to_sync(scan_image_for_existing_elements)(image_file)
+                existing_elements = scan_image_for_existing_elements(image_file)
 
                 # Re-read and build the image part for layout generation
                 image_bytes = image_file.read()
@@ -851,6 +875,11 @@ class GenerateLayoutsView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+        # Query plant inventory from database early so it's available for both prompt and validation
+        available_plants = list(InventoryItem.objects.filter(category='plant'))
+        catalog_ids = {str(p.id) for p in available_plants}
+        plant_price_map = {str(p.id): float(p.unit_price) for p in available_plants}
+
         # Update system instruction to enforce occupied boundaries
         existing_elements_str = json.dumps(existing_elements)
         system_instruction = (
@@ -862,14 +891,23 @@ class GenerateLayoutsView(APIView):
             f"CRITICAL SPATIAL CONSTRAINT: The user already has structural elements/plants in their yard at the following coordinates:\n"
             f"{existing_elements_str}\n\n"
             "You MUST treat these coordinates as occupied boundaries. Do not place any new database inventory items within a 2.0-meter radius of any existing item's coordinate pair. Your newly generated items must occupy the remaining empty space on the grid.\n\n"
-            "Your job is to select plants from the provided catalog that fit within the user's budget constraints and "
-            "generate exactly 3 distinct garden design layout styles (e.g., Symmetrical, Minimalist, Lush/Organic). "
+            "You are a professional landscape architect. Your primary goal is to maximize plant density "
+            "within the user's budget — treat the budget as a TARGET, not just a ceiling. "
+            "For each design, keep adding plants and upgrading to higher-value specimens until the "
+            "total_cost is as close to the budget as possible WITHOUT going over. "
+            "Aim for a total_cost of at least 75% of the budget. "
+            "A sparsely planted design that uses only 30% of the budget is considered a failure.\n\n"
+            "Generate exactly 3 distinct garden design layout styles (e.g., Symmetrical, Minimalist, Lush/Organic). "
             "For each design, layout the selected plants logically across a coordinate grid defined by the user's lot dimensions. "
             "All plants in the design must have X coordinates mapped between 0.0 and the lot width, "
             "and Z coordinates mapped between 0.0 and the lot length. "
             "The Y-axis rotation must be between 0.0 and 360.0 degrees. "
             "The total_cost of all placed plants in a layout must not exceed the user's specified budget. "
-            "Ensure that the designs are distinct and creative."
+            "Ensure that the designs are distinct and creative.\n\n"
+            "PLANT ID CONSTRAINT (MANDATORY): Every plant_id value you output MUST be the exact integer ID string "
+            "from the 'Provided Plant Catalog' below. Never invent plant IDs, never use plant names as IDs, "
+            "and never use descriptive strings. Any plant_id not present in the catalog will be automatically "
+            "discarded by the system, so only use IDs that are explicitly listed."
         )
 
         photo_emphasis = ""
@@ -879,27 +917,27 @@ class GenerateLayoutsView(APIView):
                 "available, empty ground space visible in the photo.\n"
             )
 
-        # Query plant inventory from database
-        available_plants = list(InventoryItem.objects.filter(category='plant'))
-        
         # Build text-based catalog for the prompt
         catalog_text = ""
         for plant in available_plants:
             desc = f" ({plant.description})" if plant.description else ""
             catalog_text += f"- ID: '{plant.id}', Name: '{plant.name}', Cost: {int(plant.unit_price)} PHP{desc}\n"
 
+        budget_floor = int(budget_int * 0.75)
         user_prompt = f"""
 Provided Plant Catalog:
 {catalog_text}
 
 User Budget & Lot Constraints:
-Budget: ₱{budget_int}
+Budget Target: ₱{budget_int} (spend between ₱{budget_floor} and ₱{budget_int})
 Lot Width (X-axis max): {lot_width_float} meters
 Lot Length (Z-axis max): {lot_length_float} meters
-Preferred Plant IDs: {json.dumps(preferred_plant_ids)}
+Preferred Plant IDs (prioritize these): {json.dumps(preferred_plant_ids)}
 {photo_emphasis}
-Please generate exactly 3 distinct GardenDesign layout options based on this catalog, budget, lot dimensions, and preferences.
+BUDGET RULE: Each design's total_cost MUST be between ₱{budget_floor} and ₱{budget_int}.
+Maximise plant count and use higher-value specimens to reach this range.
 The plant_id field in your response for each plant MUST be the database ID (integer string) of the chosen plant from the provided catalog.
+Please generate exactly 3 distinct GardenDesign layout options.
 """
         if image_part:
             contents = [image_part, user_prompt]
@@ -912,7 +950,7 @@ The plant_id field in your response for each plant MUST be the database ID (inte
 
         for attempt in range(MAX_RETRIES):
             try:
-                response = async_to_sync(client.aio.models.generate_content)(
+                response = client.models.generate_content(
                     model='gemini-2.5-flash',
                     contents=contents,
                     config={
@@ -968,6 +1006,26 @@ The plant_id field in your response for each plant MUST be the database ID (inte
                 {"error": "Received an unreadable response from the AI service. Please try again."},
                 status=status.HTTP_502_BAD_GATEWAY
             )
+
+        # 7. Validate plant IDs — strip any the AI invented that aren't in our catalog
+        if isinstance(response_data, dict) and "designs" in response_data:
+            for design in response_data["designs"]:
+                raw_plants = design.get("plants") if isinstance(design.get("plants"), list) else []
+                validated = [p for p in raw_plants if str(p.get("plant_id", "")) in catalog_ids]
+                design["plants"] = validated
+                recalculated_cost = sum(
+                    plant_price_map.get(str(p.get("plant_id", "")), 0)
+                    for p in validated
+                )
+                design["total_cost"] = recalculated_cost
+                # Flag designs where budget utilisation is under 50%
+                if recalculated_cost < budget_int * 0.5:
+                    design["density_note"] = "increase plant density"
+                    logger.warning(
+                        "Design '%s' uses only %.0f%% of budget (₱%.0f / ₱%d). Flagged for low density.",
+                        design.get("design_name", "?"), recalculated_cost / budget_int * 100,
+                        recalculated_cost, budget_int
+                    )
 
         # Merge existing elements into each design's plant list
         if isinstance(response_data, dict) and "designs" in response_data:

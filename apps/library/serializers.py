@@ -74,8 +74,8 @@ class GardenImageSerializer(serializers.ModelSerializer):
 class GardenDesignSerializer(serializers.ModelSerializer):
     class Meta:
         model = GardenDesign
-        fields = ['id', 'name', 'original_image_url', 'depth_data',
-                  'placed_items', 'dimensions', 'total_cost',
+        fields = ['id', 'name', 'original_image_url', 'reference_image_url',
+                  'depth_data', 'placed_items', 'dimensions', 'total_cost',
                   'terrain_height', 'time_of_day', 'status',
                   'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -87,7 +87,7 @@ class GardenDesignListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = GardenDesign
-        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at', 'dimensions', 'original_image_url', 'customer_name']
+        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at', 'dimensions', 'original_image_url', 'reference_image_url', 'customer_name']
 
     def get_customer_name(self, obj):
         if obj.user:
@@ -132,7 +132,10 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             return {
                 'id': obj.design.id,
                 'name': obj.design.name,
-                'image_url': image_url
+                'image_url': image_url,
+                'reference_image_url': obj.design.reference_image_url or '',
+                'placed_items': obj.design.placed_items or [],
+                'dimensions': obj.design.dimensions or {},
             }
         return None
 
