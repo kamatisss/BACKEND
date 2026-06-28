@@ -63,3 +63,4 @@ gunicorn
 dj-database-url
 google-genai
 pydantic
+reportlab

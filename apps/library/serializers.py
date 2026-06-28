@@ -1,7 +1,31 @@
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.models import User
-from .models import InventoryItem, GardenDesign, GardenImage, BlackoutDate, ServiceBooking, Order, OrderItem, Attendance
+from .models import InventoryItem, GardenDesign, GardenImage, BlackoutDate, ServiceBooking, Order, OrderItem, Attendance, ProjectMilestone, StaffAttendance, StaffProfile, Notification, ServiceReview
+
+def _resolve_canonical_role(user):
+    """
+    Return the canonical 4-tier role string for a user.
+
+    Canonical values  →  what gets embedded in the JWT and returned on login
+    ─────────────────────────────────────────────────────────────────────────
+    'SUPER_ADMIN'   superuser flag
+    'OFFICE_ADMIN'  is_staff + StaffProfile.role in ('OFFICE_ADMIN', 'Staff', None/missing)
+    'FIELD_CREW'    is_staff + StaffProfile.role == 'FIELD_CREW'
+    'CUSTOMER'      regular user, no staff flags
+    """
+    if user.is_superuser:
+        return 'SUPER_ADMIN'
+    if user.is_staff:
+        raw_role = None
+        try:
+            raw_role = user.staff_profile.role
+        except Exception:
+            pass
+        # Normalise legacy 'Staff' → 'OFFICE_ADMIN' at token-issuance time
+        return 'FIELD_CREW' if raw_role == 'FIELD_CREW' else 'OFFICE_ADMIN'
+    return 'CUSTOMER'
+
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
@@ -13,7 +37,27 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         token['email'] = user.email
         token['is_staff'] = user.is_staff
         token['is_superuser'] = user.is_superuser
+
+        # Raw DB role — kept for backward compatibility (user.staff_role on frontend)
+        try:
+            token['staff_role'] = user.staff_profile.role
+        except Exception:
+            token['staff_role'] = None
+
+        # Canonical role enum — readable as user.role on the frontend after jwtDecode()
+        # Normalises legacy 'Staff' values so the frontend never sees an unexpected string
+        token['role'] = _resolve_canonical_role(user)
+
         return token
+
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        data['username'] = self.user.username
+        data['email'] = self.user.email
+        # Login response carries the same canonical role the token contains
+        data['role'] = _resolve_canonical_role(self.user)
+        return data
+
 
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=True, style={'input_type': 'password'})
@@ -45,7 +89,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventoryItem
         fields = ['id', 'name', 'category', 'description', 'stock_quantity',
-                  'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size']
+                  'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size', 'spacing_cm']
 
     def get_model_file(self, obj):
         request = self.context.get('request')
@@ -75,7 +119,7 @@ class GardenDesignSerializer(serializers.ModelSerializer):
     class Meta:
         model = GardenDesign
         fields = ['id', 'name', 'original_image_url', 'reference_image_url',
-                  'depth_data', 'placed_items', 'dimensions', 'total_cost',
+                  'depth_data', 'placed_items', 'plant_breakdown', 'dimensions', 'total_cost',
                   'terrain_height', 'time_of_day', 'status',
                   'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -100,16 +144,86 @@ class BlackoutDateSerializer(serializers.ModelSerializer):
         model = BlackoutDate
         fields = '__all__'
 
+
+class ProjectMilestoneSerializer(serializers.ModelSerializer):
+    phase_display = serializers.CharField(source='get_phase_display', read_only=True)
+
+    class Meta:
+        model = ProjectMilestone
+        fields = ['id', 'phase', 'phase_display', 'completion_pct', 'notes', 'proof_photo_url', 'updated_at']
+        read_only_fields = ['id', 'phase_display', 'proof_photo_url', 'updated_at']
+
+
+class StaffAttendanceSerializer(serializers.ModelSerializer):
+    staff_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StaffAttendance
+        fields = [
+            'id', 'booking', 'staff', 'staff_name',
+            'timestamp_checkin', 'timestamp_checkout',
+            'gps_lat_checkin', 'gps_lng_checkin', 'distance_at_checkin_m',
+        ]
+        read_only_fields = ['id', 'staff', 'staff_name', 'timestamp_checkin', 'distance_at_checkin_m']
+
+    def get_staff_name(self, obj):
+        full_name = f"{obj.staff.first_name} {obj.staff.last_name}".strip()
+        return full_name or obj.staff.username
+
+
 class ServiceBookingSerializer(serializers.ModelSerializer):
     customer_name = serializers.SerializerMethodField()
     customer_email = serializers.SerializerMethodField()
     design_details = serializers.SerializerMethodField(read_only=True)
     clock_out_photo_url = serializers.SerializerMethodField(read_only=True)
+    project_milestones = ProjectMilestoneSerializer(many=True, read_only=True)
+    assigned_crew_names = serializers.SerializerMethodField(read_only=True)
+    assigned_crew = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(),
+        many=True,
+        required=False,
+    )
 
     class Meta:
         model = ServiceBooking
-        fields = ['id', 'user', 'customer_name', 'customer_email', 'service_type', 'scheduled_date', 'status', 'contact_number', 'preferred_time', 'service_address', 'notes', 'design', 'design_details', 'clock_out_photo_url', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'user', 'customer_name', 'customer_email', 'created_at', 'updated_at', 'design_details', 'clock_out_photo_url']
+        fields = [
+            'id', 'user', 'customer_name', 'customer_email',
+            'service_type', 'scheduled_date', 'status',
+            'contact_number', 'preferred_time', 'service_address', 'notes',
+            'site_lat', 'site_lng',
+            'assigned_crew', 'assigned_crew_names',
+            'design', 'design_details', 'clock_out_photo_url',
+            'milestones', 'progress_pct', 'staff_notes',
+            'project_milestones',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'user', 'customer_name', 'customer_email',
+            'assigned_crew_names', 'created_at', 'updated_at',
+            'design_details', 'clock_out_photo_url',
+        ]
+
+    def validate(self, attrs):
+        if 'assigned_crew' in attrs and attrs['assigned_crew']:
+            request = self.context.get('request')
+            if request and request.user:
+                user = request.user
+                is_authorized = user.is_superuser
+                if not is_authorized:
+                    try:
+                        is_authorized = user.staff_profile.role == 'OFFICE_ADMIN'
+                    except Exception:
+                        pass
+                if not is_authorized:
+                    raise serializers.ValidationError({"assigned_crew": "Only Office Admins can assign or change crew."})
+        return super().validate(attrs)
+
+    def update(self, instance, validated_data):
+        assigned_crew = validated_data.pop('assigned_crew', None)
+        instance = super().update(instance, validated_data)
+        if assigned_crew is not None:
+            instance.assigned_crew.set(assigned_crew)
+        return instance
 
     def get_customer_name(self, obj):
         if obj.user:
@@ -119,6 +233,13 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
 
     def get_customer_email(self, obj):
         return obj.user.email if obj.user else ''
+
+    def get_assigned_crew_names(self, obj):
+        names = []
+        for u in obj.assigned_crew.all():
+            full = f"{u.first_name} {u.last_name}".strip()
+            names.append(full or u.username)
+        return names
 
     def get_design_details(self, obj):
         if obj.design:
@@ -135,7 +256,9 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
                 'image_url': image_url,
                 'reference_image_url': obj.design.reference_image_url or '',
                 'placed_items': obj.design.placed_items or [],
+                'plant_breakdown': obj.design.plant_breakdown or [],
                 'dimensions': obj.design.dimensions or {},
+                'total_cost': float(obj.design.total_cost),
             }
         return None
 
@@ -171,26 +294,78 @@ class OrderSerializer(serializers.ModelSerializer):
 
 class ManageUserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False)
-    role = serializers.SerializerMethodField(read_only=True)
+    role = serializers.ChoiceField(
+        choices=['SUPER_ADMIN', 'OFFICE_ADMIN', 'FIELD_CREW', 'CUSTOMER'],
+        required=False
+    )
     input_role = serializers.CharField(write_only=True, required=False)
+    staff_role = serializers.SerializerMethodField(read_only=True)
+    input_staff_role = serializers.ChoiceField(
+        choices=['OFFICE_ADMIN', 'FIELD_CREW', ''],
+        write_only=True, required=False, allow_blank=True,
+    )
 
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'is_active', 'is_staff', 'is_superuser', 'date_joined', 'password', 'role', 'input_role')
+        fields = (
+            'id', 'username', 'email', 'first_name', 'last_name',
+            'is_active', 'is_staff', 'is_superuser', 'date_joined',
+            'password', 'role', 'input_role', 'staff_role', 'input_staff_role',
+        )
         read_only_fields = ('id', 'date_joined')
 
-    def get_role(self, obj):
-        if obj.is_superuser:
-            return 'Admin'
-        elif obj.is_staff:
-            return 'Staff'
-        return 'Customer'
+    def get_staff_role(self, obj):
+        try:
+            return obj.staff_profile.role
+        except Exception:
+            return None
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        # Determine 4-tier role
+        if instance.is_superuser:
+            ret['role'] = 'SUPER_ADMIN'
+        elif instance.is_staff:
+            try:
+                profile = instance.staff_profile
+                if profile.role == 'FIELD_CREW':
+                    ret['role'] = 'FIELD_CREW'
+                else:
+                    ret['role'] = 'OFFICE_ADMIN'
+            except Exception:
+                ret['role'] = 'OFFICE_ADMIN'
+        else:
+            ret['role'] = 'CUSTOMER'
+        return ret
 
     def create(self, validated_data):
-        input_role = validated_data.pop('input_role', 'customer')
+        role = validated_data.pop('role', None)
+        input_role = validated_data.pop('input_role', None)
+        input_staff_role = validated_data.pop('input_staff_role', None)
         password = validated_data.pop('password', None)
         
-        # If username is not provided, use email prefix or generate it
+        # Determine role from various inputs for backward compatibility
+        if not role:
+            if input_role == 'admin':
+                role = 'SUPER_ADMIN'
+            elif input_role == 'staff':
+                if input_staff_role == 'FIELD_CREW':
+                    role = 'FIELD_CREW'
+                else:
+                    role = 'OFFICE_ADMIN'
+            else:
+                role = 'CUSTOMER'
+
+        # Map role to flags
+        is_staff = False
+        is_superuser = False
+        if role == 'SUPER_ADMIN':
+            is_superuser = True
+            is_staff = True
+        elif role in ('OFFICE_ADMIN', 'FIELD_CREW'):
+            is_staff = True
+
+        # Generate unique username
         if 'username' not in validated_data or not validated_data['username']:
             email = validated_data.get('email', '')
             if email:
@@ -199,7 +374,6 @@ class ManageUserSerializer(serializers.ModelSerializer):
                 import random
                 validated_data['username'] = 'user_' + str(random.randint(1000, 9999))
         
-        # Make sure username is unique
         base_username = validated_data['username']
         username = base_username
         counter = 1
@@ -207,15 +381,6 @@ class ManageUserSerializer(serializers.ModelSerializer):
             username = f"{base_username}_{counter}"
             counter += 1
         validated_data['username'] = username
-
-        # Map role
-        is_staff = False
-        is_superuser = False
-        if input_role == 'staff':
-            is_staff = True
-        elif input_role == 'admin':
-            is_superuser = True
-            is_staff = True
 
         user = User.objects.create(
             is_staff=is_staff,
@@ -227,22 +392,58 @@ class ManageUserSerializer(serializers.ModelSerializer):
         else:
             user.set_password(User.objects.make_random_password())
         user.save()
+
+        # Save staff profile role if applicable
+        if role in ('OFFICE_ADMIN', 'FIELD_CREW'):
+            StaffProfile.objects.create(user=user, role=role)
+        else:
+            StaffProfile.objects.filter(user=user).delete()
+            
         return user
 
     def update(self, instance, validated_data):
+        role = validated_data.pop('role', None)
         input_role = validated_data.pop('input_role', None)
+        input_staff_role = validated_data.pop('input_staff_role', None)
         password = validated_data.pop('password', None)
 
-        if input_role is not None:
-            if input_role == 'staff':
-                instance.is_staff = True
-                instance.is_superuser = False
-            elif input_role == 'admin':
-                instance.is_staff = True
-                instance.is_superuser = True
+        # Determine target role
+        if role is not None:
+            pass
+        elif input_role is not None:
+            if input_role == 'admin':
+                role = 'SUPER_ADMIN'
+            elif input_role == 'staff':
+                if input_staff_role == 'FIELD_CREW':
+                    role = 'FIELD_CREW'
+                elif input_staff_role == 'OFFICE_ADMIN':
+                    role = 'OFFICE_ADMIN'
+                else:
+                    role = 'OFFICE_ADMIN'
             else:
-                instance.is_staff = False
+                role = 'CUSTOMER'
+
+        if role is not None:
+            if role == 'SUPER_ADMIN':
+                instance.is_superuser = True
+                instance.is_staff = True
+                StaffProfile.objects.filter(user=instance).delete()
+            elif role == 'OFFICE_ADMIN':
                 instance.is_superuser = False
+                instance.is_staff = True
+                profile, _ = StaffProfile.objects.get_or_create(user=instance)
+                profile.role = 'OFFICE_ADMIN'
+                profile.save()
+            elif role == 'FIELD_CREW':
+                instance.is_superuser = False
+                instance.is_staff = True
+                profile, _ = StaffProfile.objects.get_or_create(user=instance)
+                profile.role = 'FIELD_CREW'
+                profile.save()
+            elif role == 'CUSTOMER':
+                instance.is_superuser = False
+                instance.is_staff = False
+                StaffProfile.objects.filter(user=instance).delete()
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
@@ -252,6 +453,13 @@ class ManageUserSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ['id', 'message', 'is_read', 'timestamp']
+        read_only_fields = ['id', 'message', 'timestamp']
 
 
 class AttendanceSerializer(serializers.ModelSerializer):
@@ -280,3 +488,50 @@ class AttendanceSerializer(serializers.ModelSerializer):
         if obj.booking:
             return f"#{obj.booking.id} - {obj.booking.service_type} for {obj.booking.user.username} ({obj.booking.scheduled_date})"
         return 'General'
+
+
+class ServiceReviewSerializer(serializers.ModelSerializer):
+    reviewer_name = serializers.SerializerMethodField()
+    crew_names = serializers.SerializerMethodField()
+    service_type = serializers.SerializerMethodField()
+    booking = serializers.PrimaryKeyRelatedField(queryset=ServiceBooking.objects.all())
+
+    class Meta:
+        model = ServiceReview
+        fields = ['id', 'booking', 'rating', 'comment', 'reviewer_name', 'crew_names', 'service_type', 'is_public', 'created_at']
+        read_only_fields = ['id', 'reviewer_name', 'crew_names', 'service_type', 'is_public', 'created_at']
+
+    def get_reviewer_name(self, obj):
+        first = obj.user.first_name.strip()
+        last = obj.user.last_name.strip()
+        if first and last:
+            return f"{first} {last[0]}."
+        return first or obj.user.username
+
+    def get_crew_names(self, obj):
+        return [
+            (f"{u.first_name} {u.last_name}".strip() or u.username)
+            for u in obj.booking.assigned_crew.all()
+        ]
+
+    def get_service_type(self, obj):
+        return obj.booking.get_service_type_display()
+
+    def validate_rating(self, value):
+        if not 1 <= value <= 5:
+            raise serializers.ValidationError("Rating must be between 1 and 5.")
+        return value
+
+    def validate_booking(self, booking):
+        user = self.context['request'].user
+        if booking.user != user:
+            raise serializers.ValidationError("You can only review your own bookings.")
+        if booking.status not in ('Finished', 'Completed'):
+            raise serializers.ValidationError("Only completed bookings can be reviewed.")
+        if hasattr(booking, 'review'):
+            raise serializers.ValidationError("You have already submitted a review for this booking.")
+        return booking
+
+    def create(self, validated_data):
+        validated_data['user'] = self.context['request'].user
+        return super().create(validated_data)

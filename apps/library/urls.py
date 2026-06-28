@@ -6,7 +6,7 @@ from .views_api import (
     InventoryItemViewSet, GardenDesignViewSet, RegisterView, BlackoutDateViewSet,
     ServiceBookingViewSet, checkout, OrderViewSet, create_checkout_session,
     stripe_webhook, reset_password, UserViewSet, AttendanceViewSet,
-    GenerateLayoutsView, upload_design_image
+    NotificationViewSet, GenerateLayoutsView, upload_design_image, ServiceReviewViewSet,
 )
 
 router = routers.DefaultRouter()
@@ -17,6 +17,8 @@ router.register(r'bookings', ServiceBookingViewSet)
 router.register(r'orders', OrderViewSet, basename='order')
 router.register(r'users', UserViewSet, basename='user')
 router.register(r'attendance', AttendanceViewSet, basename='attendance')
+router.register(r'notifications', NotificationViewSet, basename='notification')
+router.register(r'reviews', ServiceReviewViewSet, basename='review')
 
 urlpatterns = [
     path('', include(router.urls)),
