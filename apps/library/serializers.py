@@ -1,7 +1,12 @@
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.contrib.auth.models import User
-from .models import InventoryItem, GardenDesign, GardenImage, BlackoutDate, ServiceBooking, Order, OrderItem, Attendance, ProjectMilestone, StaffAttendance, StaffProfile, Notification, ServiceReview
+from .models import (
+    InventoryItem, GardenDesign, GardenImage, BlackoutDate, ServiceBooking,
+    Order, OrderItem, Attendance, ProjectMilestone, StaffAttendance,
+    StaffProfile, Notification, ServiceReview,
+    ProjectTracker, ProjectHistoryLog, ProjectProgressMedia,
+)
 
 def _resolve_canonical_role(user):
     """
@@ -535,3 +540,146 @@ class ServiceReviewSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data['user'] = self.context['request'].user
         return super().create(validated_data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project Tracker serializers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProjectHistoryLogSerializer(serializers.ModelSerializer):
+    trigger_user_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(
+        source='get_status_reached_display', read_only=True
+    )
+
+    class Meta:
+        model = ProjectHistoryLog
+        fields = [
+            'id', 'status_reached', 'status_display',
+            'timestamp', 'trigger_user', 'trigger_user_name', 'remarks',
+        ]
+        read_only_fields = ['id', 'timestamp', 'status_display', 'trigger_user_name']
+
+    def get_trigger_user_name(self, obj):
+        if obj.trigger_user:
+            full = f"{obj.trigger_user.first_name} {obj.trigger_user.last_name}".strip()
+            return full or obj.trigger_user.username
+        return 'System'
+
+
+class ProjectProgressMediaSerializer(serializers.ModelSerializer):
+    uploader_name = serializers.SerializerMethodField()
+    file_url = serializers.SerializerMethodField()
+    phase_display = serializers.CharField(
+        source='get_construction_phase_display', read_only=True
+    )
+
+    class Meta:
+        model = ProjectProgressMedia
+        fields = [
+            'id', 'project', 'construction_phase', 'phase_display',
+            'file_path', 'file_url', 'uploaded_at',
+            'uploader', 'uploader_name', 'description', 'location',
+        ]
+        read_only_fields = [
+            'id', 'uploaded_at', 'uploader', 'uploader_name',
+            'file_url', 'phase_display',
+        ]
+
+    def get_uploader_name(self, obj):
+        if obj.uploader:
+            full = f"{obj.uploader.first_name} {obj.uploader.last_name}".strip()
+            return full or obj.uploader.username
+        return 'Unknown'
+
+    def get_file_url(self, obj):
+        request = self.context.get('request')
+        if obj.file_path and hasattr(obj.file_path, 'url'):
+            return (
+                request.build_absolute_uri(obj.file_path.url)
+                if request else obj.file_path.url
+            )
+        return None
+
+
+class ProjectTrackerSerializer(serializers.ModelSerializer):
+    supervisor_name = serializers.SerializerMethodField()
+    booking_customer = serializers.SerializerMethodField()
+    booking_service = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    history_logs = ProjectHistoryLogSerializer(many=True, read_only=True)
+    progress_media = ProjectProgressMediaSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ProjectTracker
+        fields = [
+            'id', 'booking', 'booking_customer', 'booking_service',
+            'status', 'status_display', 'progress_percentage',
+            'supervisor', 'supervisor_name',
+            'estimated_end_date', 'total_price', 'remaining_balance',
+            'created_at', 'updated_at',
+            'history_logs', 'progress_media',
+        ]
+        read_only_fields = [
+            'id', 'progress_percentage', 'created_at', 'updated_at',
+            'status_display', 'booking_customer', 'booking_service',
+            'supervisor_name',
+        ]
+
+    def get_supervisor_name(self, obj):
+        if obj.supervisor:
+            full = f"{obj.supervisor.first_name} {obj.supervisor.last_name}".strip()
+            return full or obj.supervisor.username
+        return None
+
+    def get_booking_customer(self, obj):
+        if obj.booking and obj.booking.user:
+            u = obj.booking.user
+            full = f"{u.first_name} {u.last_name}".strip()
+            return full or u.username
+        return 'Unknown'
+
+    def get_booking_service(self, obj):
+        if obj.booking:
+            return obj.booking.get_service_type_display()
+        return None
+
+
+class ProjectTrackerListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for list views — omits nested logs and media."""
+    supervisor_name = serializers.SerializerMethodField()
+    booking_customer = serializers.SerializerMethodField()
+    booking_service = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = ProjectTracker
+        fields = [
+            'id', 'booking', 'booking_customer', 'booking_service',
+            'status', 'status_display', 'progress_percentage',
+            'supervisor', 'supervisor_name',
+            'estimated_end_date', 'total_price', 'remaining_balance',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'progress_percentage', 'updated_at',
+            'status_display', 'booking_customer', 'booking_service', 'supervisor_name',
+        ]
+
+    def get_supervisor_name(self, obj):
+        if obj.supervisor:
+            full = f"{obj.supervisor.first_name} {obj.supervisor.last_name}".strip()
+            return full or obj.supervisor.username
+        return None
+
+    def get_booking_customer(self, obj):
+        if obj.booking and obj.booking.user:
+            u = obj.booking.user
+            full = f"{u.first_name} {u.last_name}".strip()
+            return full or u.username
+        return 'Unknown'
+
+    def get_booking_service(self, obj):
+        if obj.booking:
+            return obj.booking.get_service_type_display()
+        return None

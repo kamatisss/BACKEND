@@ -107,6 +107,7 @@ class ServiceBooking(models.Model):
         ('maintenance', 'Maintenance'),
         ('consultation', 'Consultation'),
         ('hardscaping', 'Full Hardscaping'),
+        ('Softscape', 'Softscape / Planting Services'),
     ]
     STATUS_CHOICES = [
         ('Pending',    'Pending'),
@@ -161,11 +162,17 @@ class ServiceBooking(models.Model):
 
 class ProjectMilestone(models.Model):
     PHASE_CHOICES = [
-        ('site_prep',   'Site Preparation'),
-        ('hardscaping', 'Hardscaping'),
-        ('softscaping', 'Softscaping'),
-        ('cleanup',     'Cleanup & Handover'),
+        ('design_contract',  'Design Finalized & Contract Signed'),
+        ('site_prep',        'Site Preparation Complete'),
+        ('installation',     'Installation Service (Hardscape/Softscape)'),
+        ('final_inspection', 'Final Inspection & Output Uploaded'),
+        # Legacy phases kept for backward compatibility
+        ('hardscaping',      'Hardscaping'),
+        ('softscaping',      'Softscaping'),
+        ('cleanup',          'Cleanup & Handover'),
     ]
+    ACTIVE_PHASES = ['design_contract', 'site_prep', 'installation', 'final_inspection']
+
     booking = models.ForeignKey(ServiceBooking, on_delete=models.CASCADE, related_name='project_milestones')
     phase = models.CharField(max_length=20, choices=PHASE_CHOICES)
     completion_pct = models.PositiveSmallIntegerField(default=0)
@@ -289,6 +296,150 @@ class Attendance(models.Model):
 
     def __str__(self):
         return f"Attendance for {self.staff.username} on {self.clock_in_time}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project Tracker pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+STATUS_PROGRESS_MAP = {
+    'PENDING':                  0,
+    'CONSULTATION_SCHEDULED':   5,
+    'SITE_INSPECTION':         10,
+    'QUOTATION_APPROVED':      15,
+    'DESIGN_PREPARATION':      20,
+    'DESIGN_APPROVED':         25,
+    'PROJECT_SCHEDULED':       30,
+    'MATERIALS_PREPARATION':   40,
+    'PROJECT_STARTED':         50,
+    'SITE_PREPARATION':        60,
+    'PLANTING':                70,
+    'HARDSCAPE_INSTALLATION':  75,
+    'LIGHTING_INSTALLATION':   85,
+    'DECORATION':              90,
+    'FINAL_INSPECTION':        95,
+    'COMPLETED':              100,
+    'CUSTOMER_FEEDBACK':      100,
+}
+
+
+class ProjectTracker(models.Model):
+    STATUS_CHOICES = [
+        ('PENDING',                'Pending'),
+        ('CONSULTATION_SCHEDULED', 'Consultation Scheduled'),
+        ('SITE_INSPECTION',        'Site Inspection'),
+        ('QUOTATION_APPROVED',     'Quotation Approved'),
+        ('DESIGN_PREPARATION',     'Design Preparation'),
+        ('DESIGN_APPROVED',        'Design Approved'),
+        ('PROJECT_SCHEDULED',      'Project Scheduled'),
+        ('MATERIALS_PREPARATION',  'Materials Preparation'),
+        ('PROJECT_STARTED',        'Project Started'),
+        ('SITE_PREPARATION',       'Site Preparation'),
+        ('PLANTING',               'Planting'),
+        ('HARDSCAPE_INSTALLATION', 'Hardscape Installation'),
+        ('LIGHTING_INSTALLATION',  'Lighting Installation'),
+        ('DECORATION',             'Decoration'),
+        ('FINAL_INSPECTION',       'Final Inspection'),
+        ('COMPLETED',              'Completed'),
+        ('CUSTOMER_FEEDBACK',      'Customer Feedback'),
+    ]
+
+    booking = models.OneToOneField(
+        ServiceBooking, on_delete=models.CASCADE, related_name='tracker'
+    )
+    status = models.CharField(
+        max_length=30, choices=STATUS_CHOICES, default='PENDING'
+    )
+    progress_percentage = models.PositiveSmallIntegerField(
+        default=0,
+        help_text='Auto-computed from status — do not set manually'
+    )
+    supervisor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='supervised_projects'
+    )
+    estimated_end_date = models.DateField(null=True, blank=True)
+    total_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    remaining_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def save(self, *args, **kwargs):
+        self.progress_percentage = STATUS_PROGRESS_MAP.get(self.status, 0)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return (
+            f"Tracker#{self.pk} — Booking#{self.booking_id} "
+            f"[{self.status} {self.progress_percentage}%]"
+        )
+
+
+class ProjectHistoryLog(models.Model):
+    """
+    Immutable append-only audit trail for ProjectTracker pipeline transitions.
+    Each status change creates exactly one log entry; updates are blocked at
+    the model level via the save() override.
+    """
+    project = models.ForeignKey(
+        ProjectTracker, on_delete=models.CASCADE, related_name='history_logs'
+    )
+    status_reached = models.CharField(
+        max_length=30, choices=ProjectTracker.STATUS_CHOICES
+    )
+    timestamp = models.DateTimeField(auto_now_add=True)
+    trigger_user = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='triggered_project_logs'
+    )
+    remarks = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['-timestamp']
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None:
+            raise ValueError(
+                "ProjectHistoryLog entries are immutable — updates are not permitted."
+            )
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        ts = self.timestamp.strftime('%Y-%m-%d %H:%M') if self.timestamp else '—'
+        return f"Log#{self.pk} {self.status_reached} @ {ts}"
+
+
+class ProjectProgressMedia(models.Model):
+    PHASE_CHOICES = [
+        ('BEFORE', 'Before'),
+        ('DURING', 'During'),
+        ('AFTER',  'After'),
+    ]
+
+    project = models.ForeignKey(
+        ProjectTracker, on_delete=models.CASCADE, related_name='progress_media'
+    )
+    construction_phase = models.CharField(max_length=10, choices=PHASE_CHOICES)
+    file_path = models.ImageField(upload_to='project_progress/%Y/%m/')
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    uploader = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='uploaded_progress_media'
+    )
+    description = models.TextField(blank=True, default='')
+    location = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        ordering = ['-uploaded_at']
+
+    def __str__(self):
+        return (
+            f"Media#{self.pk} [{self.construction_phase}] "
+            f"Tracker#{self.project_id}"
+        )
 
 
 class ServiceReview(models.Model):

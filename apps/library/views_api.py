@@ -128,7 +128,12 @@ from django.contrib.auth.models import User
 from django.db import transaction
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import InventoryItem, GardenDesign, BlackoutDate, ServiceBooking, Order, OrderItem, Attendance, ProjectMilestone, StaffAttendance, StaffProfile, Notification, ServiceReview
+from .models import (
+    InventoryItem, GardenDesign, BlackoutDate, ServiceBooking,
+    Order, OrderItem, Attendance, ProjectMilestone, StaffAttendance,
+    StaffProfile, Notification, ServiceReview,
+    ProjectTracker, ProjectHistoryLog, ProjectProgressMedia,
+)
 from .serializers import (
     InventoryItemSerializer,
     GardenDesignSerializer,
@@ -144,6 +149,10 @@ from .serializers import (
     StaffAttendanceSerializer,
     NotificationSerializer,
     ServiceReviewSerializer,
+    ProjectTrackerSerializer,
+    ProjectTrackerListSerializer,
+    ProjectHistoryLogSerializer,
+    ProjectProgressMediaSerializer,
 )
 
 class CustomTokenObtainPairView(TokenObtainPairView):
@@ -437,6 +446,7 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         phase = request.data.get('phase')
         completion_pct = request.data.get('completion_pct')
         notes = request.data.get('notes', '')
+        proof_photo_url_direct = request.data.get('proof_photo_url', '')
 
         valid_phases = dict(ProjectMilestone.PHASE_CHOICES)
         if phase not in valid_phases:
@@ -456,8 +466,11 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         if notes:
             milestone.notes = notes
 
+        # Accept a directly-supplied proof URL (e.g. from field crew image uploads)
+        if proof_photo_url_direct:
+            milestone.proof_photo_url = proof_photo_url_direct
         # Auto-bind proof photo from the most recent clock-out when phase completes
-        if pct == 100 and not milestone.proof_photo_url:
+        elif pct == 100 and not milestone.proof_photo_url:
             latest_checkout = (
                 Attendance.objects.filter(booking=booking, clock_out_time__isnull=False)
                 .exclude(clock_out_photo_url='').exclude(clock_out_photo_url__isnull=True)
@@ -471,10 +484,12 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
 
         milestone.save()
 
-        # Count-based overall progress: completed phases (pct=100) / total phases * 100
-        total_phases = len(valid_phases)
-        completed_count = ProjectMilestone.objects.filter(booking=booking, completion_pct=100).count()
-        booking.progress_pct = int(completed_count / total_phases * 100)
+        # Progress is based on the 4 active pipeline phases only (not legacy phases)
+        active_phases = ProjectMilestone.ACTIVE_PHASES
+        completed_count = ProjectMilestone.objects.filter(
+            booking=booking, phase__in=active_phases, completion_pct=100
+        ).count()
+        booking.progress_pct = int(completed_count / len(active_phases) * 100)
         
         # Auto-update status to Installing if not already there, since active work is happening
         if booking.status in ['Pending', 'Preparing']:
@@ -1782,8 +1797,9 @@ class GenerateLayoutsView(APIView):
     - preferred_plant_ids: list of str (optional)
 
     Generates 3 distinct garden design options using Gemini 2.5 (3 parallel calls).
+    Guest users receive the generated JSON without it being saved to the database.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request, *args, **kwargs):
         # 1. Parse request body
@@ -2144,3 +2160,155 @@ class ServiceReviewViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(reviews, many=True)
         return Response(serializer.data)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project Tracker endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProjectTrackerViewSet(viewsets.ModelViewSet):
+    """
+    GET    /api/projects/                           List all trackers
+                                                    (staff/admin → all;
+                                                     customer → own bookings only)
+    GET    /api/projects/<id>/                      Full detail with history & media
+    POST   /api/projects/                           Create tracker  [admin/staff]
+    PATCH  /api/projects/<id>/                      Edit fields     [admin/staff]
+    PATCH  /api/projects/<id>/update-status/        Advance pipeline status,
+                                                    auto-log & recompute %  [admin/staff]
+    POST   /api/projects/<id>/upload-media/         Attach a progress photo  [staff]
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return ProjectTrackerListSerializer
+        return ProjectTrackerSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = ProjectTracker.objects.select_related(
+            'booking', 'booking__user', 'supervisor',
+        ).prefetch_related(
+            'history_logs',
+            'history_logs__trigger_user',
+            'progress_media',
+            'progress_media__uploader',
+        )
+        if user.is_staff or user.is_superuser:
+            return qs.all()
+        # Customers see only the tracker linked to their own bookings
+        return qs.filter(booking__user=user)
+
+    def get_permissions(self):
+        # Write operations (create / edit / status advance) require admin/staff
+        if self.action in ('create', 'update', 'partial_update', 'destroy', 'update_status'):
+            return [IsAuthenticated(), IsOfficeAdmin()]
+        return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        tracker = serializer.save()
+        ProjectHistoryLog.objects.create(
+            project=tracker,
+            status_reached=tracker.status,
+            trigger_user=self.request.user,
+            remarks='Project tracker initialized.',
+        )
+
+    # ── GET /api/projects/supervisor-options/ ────────────────────────────────
+    @action(detail=False, methods=['get'], url_path='supervisor-options')
+    def supervisor_options(self, request):
+        crew = User.objects.filter(
+            staff_profile__role='FIELD_CREW',
+            is_active=True,
+        ).select_related('staff_profile').order_by('first_name', 'username')
+        return Response([
+            {
+                'id': u.id,
+                'name': f"{u.first_name} {u.last_name}".strip() or u.username,
+            }
+            for u in crew
+        ])
+
+    # ── PATCH /api/projects/<id>/update-status/ ──────────────────────────────
+    @action(detail=True, methods=['patch'], url_path='update-status')
+    def update_status(self, request, pk=None):
+        tracker = self.get_object()
+
+        new_status = (request.data.get('status') or '').strip()
+        remarks = (request.data.get('remarks') or '').strip()
+
+        valid_statuses = dict(ProjectTracker.STATUS_CHOICES)
+        if not new_status or new_status not in valid_statuses:
+            return Response(
+                {
+                    'error': 'Invalid or missing status.',
+                    'valid_choices': list(valid_statuses.keys()),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        previous_status = tracker.status
+        tracker.status = new_status
+        tracker.save()  # progress_percentage auto-recomputed inside save()
+
+        # Append an immutable audit log entry for this transition
+        ProjectHistoryLog.objects.create(
+            project=tracker,
+            status_reached=new_status,
+            trigger_user=request.user,
+            remarks=remarks,
+        )
+
+        logger.info(
+            "ProjectTracker #%s: %s → %s by user #%s",
+            tracker.pk, previous_status, new_status, request.user.pk,
+        )
+
+        serializer = ProjectTrackerSerializer(
+            tracker, context={'request': request}
+        )
+        return Response(serializer.data)
+
+    # ── POST /api/projects/<id>/upload-media/ ────────────────────────────────
+    @action(detail=True, methods=['post'], url_path='upload-media')
+    def upload_media(self, request, pk=None):
+        # Field crew and admin can both upload photos; customers cannot
+        if not (request.user.is_staff or request.user.is_superuser):
+            return Response(
+                {'error': 'Staff access required to upload progress media.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        tracker = self.get_object()
+
+        construction_phase = (
+            request.data.get('construction_phase') or ''
+        ).strip().upper()
+        description = (request.data.get('description') or '').strip()
+        location = (request.data.get('location') or '').strip()
+        file_obj = request.FILES.get('file')
+
+        if construction_phase not in ('BEFORE', 'DURING', 'AFTER'):
+            return Response(
+                {'error': "construction_phase must be 'BEFORE', 'DURING', or 'AFTER'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not file_obj:
+            return Response(
+                {'error': 'A file upload is required (multipart field name: file).'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        media = ProjectProgressMedia.objects.create(
+            project=tracker,
+            construction_phase=construction_phase,
+            file_path=file_obj,
+            uploader=request.user,
+            description=description,
+            location=location,
+        )
+
+        serializer = ProjectProgressMediaSerializer(
+            media, context={'request': request}
+        )
+        return Response(serializer.data, status=status.HTTP_201_CREATED)

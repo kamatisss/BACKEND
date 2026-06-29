@@ -7,6 +7,7 @@ from .views_api import (
     ServiceBookingViewSet, checkout, OrderViewSet, create_checkout_session,
     stripe_webhook, reset_password, UserViewSet, AttendanceViewSet,
     NotificationViewSet, GenerateLayoutsView, upload_design_image, ServiceReviewViewSet,
+    ProjectTrackerViewSet,
 )
 
 router = routers.DefaultRouter()
@@ -19,6 +20,7 @@ router.register(r'users', UserViewSet, basename='user')
 router.register(r'attendance', AttendanceViewSet, basename='attendance')
 router.register(r'notifications', NotificationViewSet, basename='notification')
 router.register(r'reviews', ServiceReviewViewSet, basename='review')
+router.register(r'projects', ProjectTrackerViewSet, basename='project')
 
 urlpatterns = [
     path('', include(router.urls)),
