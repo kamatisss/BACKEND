@@ -4,7 +4,7 @@ from django.contrib.auth.models import User
 from .models import (
     InventoryItem, GardenDesign, GardenImage, BlackoutDate, ServiceBooking,
     Order, OrderItem, Attendance, ProjectMilestone, StaffAttendance,
-    StaffProfile, Notification, ServiceReview,
+    StaffProfile, Notification, ServiceReview, ProductReview,
     ProjectTracker, ProjectHistoryLog, ProjectProgressMedia,
 )
 
@@ -90,11 +90,22 @@ class UserSerializer(serializers.ModelSerializer):
 class InventoryItemSerializer(serializers.ModelSerializer):
     model_file = serializers.SerializerMethodField()
     thumbnail = serializers.SerializerMethodField()
+    # Populated by InventoryItemViewSet's annotated queryset (public product reviews)
+    avg_rating = serializers.SerializerMethodField()
+    review_count = serializers.SerializerMethodField()
 
     class Meta:
         model = InventoryItem
         fields = ['id', 'name', 'category', 'description', 'stock_quantity',
-                  'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size', 'spacing_cm']
+                  'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size', 'spacing_cm',
+                  'avg_rating', 'review_count']
+
+    def get_avg_rating(self, obj):
+        avg = getattr(obj, 'avg_rating', None)
+        return round(avg, 1) if avg is not None else None
+
+    def get_review_count(self, obj):
+        return getattr(obj, 'review_count', 0)
 
     def get_model_file(self, obj):
         request = self.context.get('request')
@@ -125,7 +136,7 @@ class GardenDesignSerializer(serializers.ModelSerializer):
         model = GardenDesign
         fields = ['id', 'name', 'original_image_url', 'reference_image_url',
                   'depth_data', 'placed_items', 'plant_breakdown', 'dimensions', 'total_cost',
-                  'terrain_height', 'time_of_day', 'status',
+                  'cost_estimate', 'terrain_height', 'time_of_day', 'status',
                   'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
@@ -183,6 +194,7 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
     clock_out_photo_url = serializers.SerializerMethodField(read_only=True)
     project_milestones = ProjectMilestoneSerializer(many=True, read_only=True)
     assigned_crew_names = serializers.SerializerMethodField(read_only=True)
+    tracker = serializers.SerializerMethodField(read_only=True)
     assigned_crew = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(),
         many=True,
@@ -199,14 +211,31 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'assigned_crew', 'assigned_crew_names',
             'design', 'design_details', 'clock_out_photo_url',
             'milestones', 'progress_pct', 'staff_notes',
-            'project_milestones',
+            'project_milestones', 'tracker',
             'created_at', 'updated_at',
         ]
         read_only_fields = [
             'id', 'user', 'customer_name', 'customer_email',
             'assigned_crew_names', 'created_at', 'updated_at',
-            'design_details', 'clock_out_photo_url',
+            'design_details', 'clock_out_photo_url', 'tracker',
         ]
+
+    def get_tracker(self, obj):
+        """Project billing/stage summary — full detail lives at /api/projects/<id>/."""
+        try:
+            t = obj.tracker
+        except ServiceBooking.tracker.RelatedObjectDoesNotExist:
+            return None
+        return {
+            'id': t.id,
+            'status': t.status,
+            'status_display': t.get_status_display(),
+            'progress_percentage': t.progress_percentage,
+            'total_price': float(t.total_price),
+            'remaining_balance': float(t.remaining_balance),
+            'amount_paid': float(t.total_price - t.remaining_balance),
+            'estimated_end_date': t.estimated_end_date,
+        }
 
     def validate(self, attrs):
         if 'assigned_crew' in attrs and attrs['assigned_crew']:
@@ -283,10 +312,18 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
 
 class OrderItemSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
+    review = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderItem
-        fields = ['id', 'item', 'item_name', 'quantity', 'price_at_booking']
+        fields = ['id', 'item', 'item_name', 'quantity', 'price_at_booking', 'review']
+
+    def get_review(self, obj):
+        # The customer's own review of this purchased line, or None if not yet reviewed
+        review = getattr(obj, 'review', None)
+        if review is None:
+            return None
+        return {'id': review.id, 'rating': review.rating, 'comment': review.comment}
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
@@ -495,6 +532,15 @@ class AttendanceSerializer(serializers.ModelSerializer):
         return 'General'
 
 
+def public_reviewer_name(user):
+    """'Maria S.' — never the username, which can be an email or a handle."""
+    first = user.first_name.strip()
+    last = user.last_name.strip()
+    if first and last:
+        return f"{first} {last[0]}."
+    return first or 'Verified customer'
+
+
 class ServiceReviewSerializer(serializers.ModelSerializer):
     reviewer_name = serializers.SerializerMethodField()
     crew_names = serializers.SerializerMethodField()
@@ -503,21 +549,17 @@ class ServiceReviewSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ServiceReview
-        fields = ['id', 'booking', 'rating', 'comment', 'reviewer_name', 'crew_names', 'service_type', 'is_public', 'created_at']
-        read_only_fields = ['id', 'reviewer_name', 'crew_names', 'service_type', 'is_public', 'created_at']
+        fields = ['id', 'booking', 'rating', 'comment', 'reviewer_name', 'crew_names', 'service_type', 'is_public',
+                  'reply', 'replied_at', 'created_at']
+        # is_public is the customer's choice when submitting (default: shown publicly)
+        read_only_fields = ['id', 'reviewer_name', 'crew_names', 'service_type', 'reply', 'replied_at', 'created_at']
 
     def get_reviewer_name(self, obj):
-        first = obj.user.first_name.strip()
-        last = obj.user.last_name.strip()
-        if first and last:
-            return f"{first} {last[0]}."
-        return first or obj.user.username
+        return public_reviewer_name(obj.user)
 
     def get_crew_names(self, obj):
-        return [
-            (f"{u.first_name} {u.last_name}".strip() or u.username)
-            for u in obj.booking.assigned_crew.all()
-        ]
+        # First names only — this is also served publicly
+        return [u.first_name.strip() or 'Crew member' for u in obj.booking.assigned_crew.all()]
 
     def get_service_type(self, obj):
         return obj.booking.get_service_type_display()
@@ -539,6 +581,47 @@ class ServiceReviewSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         validated_data['user'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+class ProductReviewSerializer(serializers.ModelSerializer):
+    reviewer_name = serializers.SerializerMethodField()
+    product_name = serializers.SerializerMethodField()
+    order_id = serializers.IntegerField(source='order_item.order_id', read_only=True)
+    order_item = serializers.PrimaryKeyRelatedField(queryset=OrderItem.objects.select_related('order', 'item'))
+
+    class Meta:
+        model = ProductReview
+        fields = ['id', 'order_item', 'order_id', 'product', 'product_name', 'rating', 'comment',
+                  'reviewer_name', 'is_public', 'reply', 'replied_at', 'created_at']
+        read_only_fields = ['id', 'order_id', 'product', 'product_name', 'reviewer_name', 'reply', 'replied_at', 'created_at']
+
+    def get_reviewer_name(self, obj):
+        return public_reviewer_name(obj.user)
+
+    def get_product_name(self, obj):
+        return obj.product.name if obj.product else 'Deleted Item'
+
+    def validate_rating(self, value):
+        if not 1 <= value <= 5:
+            raise serializers.ValidationError("Rating must be between 1 and 5.")
+        return value
+
+    def validate_order_item(self, order_item):
+        user = self.context['request'].user
+        if order_item.order.user != user:
+            raise serializers.ValidationError("You can only review products from your own orders.")
+        if order_item.order.status != 'Delivered':
+            raise serializers.ValidationError("Products can be reviewed once the order is delivered.")
+        if order_item.item is None:
+            raise serializers.ValidationError("This product is no longer available for review.")
+        if hasattr(order_item, 'review'):
+            raise serializers.ValidationError("You have already reviewed this product for this order.")
+        return order_item
+
+    def create(self, validated_data):
+        validated_data['user'] = self.context['request'].user
+        validated_data['product'] = validated_data['order_item'].item
         return super().create(validated_data)
 
 
@@ -625,6 +708,15 @@ class ProjectTrackerSerializer(serializers.ModelSerializer):
             'status_display', 'booking_customer', 'booking_service',
             'supervisor_name',
         ]
+
+    def validate(self, attrs):
+        total = attrs.get('total_price', getattr(self.instance, 'total_price', 0))
+        remaining = attrs.get('remaining_balance', getattr(self.instance, 'remaining_balance', 0))
+        if total < 0 or remaining < 0:
+            raise serializers.ValidationError("Prices and balances cannot be negative.")
+        if remaining > total:
+            raise serializers.ValidationError({"remaining_balance": "Remaining balance cannot exceed the total price."})
+        return attrs
 
     def get_supervisor_name(self, obj):
         if obj.supervisor:

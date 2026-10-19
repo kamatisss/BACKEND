@@ -157,6 +157,23 @@ STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
 # The base URL of your React frontend (used to build Stripe success/cancel redirect URLs)
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 
+# Daily limits per account. An AI layout run makes 1 Gemini request (the other two
+# designs come from the smart layout engine); the free tier allows ~20 a day per key.
+# AI_MODE=engine_only (env) skips Gemini entirely, e.g. as insurance on demo day.
+REST_FRAMEWORK.setdefault('DEFAULT_THROTTLE_RATES', {}).update({
+    'ai_layouts': os.environ.get('AI_LAYOUTS_PER_DAY', '3') + '/day',
+    'depth_maps': os.environ.get('DEPTH_MAPS_PER_DAY', '20') + '/day',
+    # Smart layouts (engine) cost nothing; this only stops abuse. Photo zone scans use Gemini Vision.
+    'smart_layouts': os.environ.get('SMART_LAYOUTS_PER_DAY', '40') + '/day',
+    'zone_scans': os.environ.get('ZONE_SCANS_PER_DAY', '15') + '/day',
+    'estimates': '300/hour',  # public price estimates (Studio summary)
+    'funnel_events': '300/hour',
+})
+
+# Project Hub track record: the year the business started, e.g. 2015. Leave unset
+# to hide "years in business" rather than show an unverified number.
+BUSINESS_FOUNDED_YEAR = int(os.environ['BUSINESS_FOUNDED_YEAR']) if os.environ.get('BUSINESS_FOUNDED_YEAR', '').isdigit() else None
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/6.0/ref/settings/#default-auto-field
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

@@ -3,58 +3,14 @@ import os
 import json
 import logging
 import time
-import hashlib
+from urllib.parse import quote
 import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from rest_framework.views import APIView
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
-from pydantic import BaseModel, Field
-from typing import List
+from rest_framework.throttling import UserRateThrottle
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 
 logger = logging.getLogger(__name__)
-
-# ── AI latency optimisation ─────────────────────────────────────
-GRID_COLS = 20          # compressed coordinate grid width
-GRID_ROWS = 20          # compressed coordinate grid height
-MAX_RETRIES = 3
-_CACHE_TTL = 300        # seconds – layouts cached for 5 min
-
-_layout_cache: dict = {}
-
-
-def _make_cache_key(budget: int, lot_w: float, lot_l: float, pids: list) -> str:
-    raw = f"{budget}|{round(lot_w,1)}|{round(lot_l,1)}|{','.join(sorted(str(p) for p in pids))}"
-    return hashlib.md5(raw.encode()).hexdigest()
-
-
-def _get_cached(key: str):
-    entry = _layout_cache.get(key)
-    if entry and time.time() - entry[0] < _CACHE_TTL:
-        return entry[1]
-    _layout_cache.pop(key, None)
-    return None
-
-
-def _set_cached(key: str, data: dict) -> None:
-    _layout_cache[key] = (time.time(), data)
-
-
-def _expand_grid_coords(plants: list, lot_width: float, lot_length: float) -> list:
-    """Convert AI-returned gx/gz grid indices into real-world x/z metres."""
-    cell_w = lot_width / GRID_COLS
-    cell_l = lot_length / GRID_ROWS
-    result = []
-    for p in plants:
-        item = dict(p)
-        item['x'] = round(item.pop('gx', 0) * cell_w, 3)
-        item['z'] = round(item.pop('gz', 0) * cell_l, 3)
-        result.append(item)
-    return result
-
 
 def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Return distance in metres between two GPS coordinates."""
@@ -64,6 +20,32 @@ def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     dlambda = math.radians(lng2 - lng1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     return R * 2 * math.asin(math.sqrt(a))
+
+
+# Crew must be this close to a booking's GPS pin to clock in / check in there
+SITE_RADIUS_M = 50
+
+
+def _complete_tracker(booking, user, remarks):
+    """Move the booking's project tracker to COMPLETED (creating it for legacy bookings)."""
+    estimate = booking.design.total_cost if booking.design else 0
+    tracker, _ = ProjectTracker.objects.get_or_create(
+        booking=booking, defaults={'total_price': estimate, 'remaining_balance': estimate},
+    )
+    if tracker.status not in ('COMPLETED', 'CUSTOMER_FEEDBACK'):
+        tracker.status = 'COMPLETED'
+        tracker.save()
+        ProjectHistoryLog.objects.create(
+            project=tracker, status_reached='COMPLETED', trigger_user=user, remarks=remarks,
+        )
+
+
+def _draft_portfolio(booking, user):
+    """Draft the Project Hub entry on sign-off; never let a portfolio problem block the sign-off."""
+    try:
+        create_portfolio_draft(booking, user)
+    except Exception:
+        logger.exception("Could not draft portfolio entry for booking #%s", booking.pk)
 
 
 def bind_proof_to_milestone(booking_id: int, phase: str, photo_url: str) -> None:
@@ -126,13 +108,17 @@ class IsOfficeAdmin(BasePermission):
 
 from django.contrib.auth.models import User
 from django.db import transaction
+from django.db.models import Avg, Count, Q
+from django.shortcuts import get_object_or_404
 from rest_framework_simplejwt.views import TokenObtainPairView
+
+from .portfolio import create_portfolio_draft, sanitize_image
 
 from .models import (
     InventoryItem, GardenDesign, BlackoutDate, ServiceBooking,
     Order, OrderItem, Attendance, ProjectMilestone, StaffAttendance,
-    StaffProfile, Notification, ServiceReview,
-    ProjectTracker, ProjectHistoryLog, ProjectProgressMedia,
+    StaffProfile, Notification, ServiceReview, ProductReview,
+    ProjectTracker, ProjectHistoryLog, ProjectProgressMedia, PricingSettings,
 )
 from .serializers import (
     InventoryItemSerializer,
@@ -149,6 +135,7 @@ from .serializers import (
     StaffAttendanceSerializer,
     NotificationSerializer,
     ServiceReviewSerializer,
+    ProductReviewSerializer,
     ProjectTrackerSerializer,
     ProjectTrackerListSerializer,
     ProjectHistoryLogSerializer,
@@ -181,7 +168,11 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
         return super().get_permissions()
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        public_reviews = Q(reviews__is_public=True)
+        qs = super().get_queryset().annotate(
+            avg_rating=Avg('reviews__rating', filter=public_reviews),
+            review_count=Count('reviews', filter=public_reviews),
+        )
         category = self.request.query_params.get('category')
         if category:
             qs = qs.filter(category=category)
@@ -313,7 +304,7 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        base = ServiceBooking.objects.select_related('design', 'design__garden_image').prefetch_related('assigned_crew')
+        base = ServiceBooking.objects.select_related('design', 'design__garden_image', 'tracker').prefetch_related('assigned_crew')
 
         if not (user.is_staff or user.is_superuser):
             return base.filter(user=user)
@@ -334,37 +325,129 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
             try:
                 from .models import GardenDesign
                 design = GardenDesign.objects.get(id=design_id)
-                serializer.save(user=self.request.user, design=design)
+                booking = serializer.save(user=self.request.user, design=design)
             except Exception:
-                serializer.save(user=self.request.user)
+                booking = serializer.save(user=self.request.user)
         else:
-            serializer.save(user=self.request.user)
+            booking = serializer.save(user=self.request.user)
+
+        # Every booking gets a project tracker so billing and stages exist from day one.
+        # The design estimate is the starting contract price; staff can adjust it.
+        estimate = booking.design.total_cost if booking.design else 0
+        tracker = ProjectTracker.objects.create(
+            booking=booking, total_price=estimate, remaining_balance=estimate,
+        )
+        ProjectHistoryLog.objects.create(
+            project=tracker, status_reached=tracker.status, trigger_user=self.request.user,
+            remarks='Project created from customer booking.',
+        )
 
     @action(detail=True, methods=['patch'], permission_classes=[IsAuthenticated])
     def update_status(self, request, pk=None):
+        """
+        Field crew  → may only submit their work for sign-off ('For Review').
+        Office admin → any transition; approving 'Finished' is the sign-off and
+                       also completes the project tracker.
+        """
         user = request.user
         if not (user.is_staff or user.is_superuser):
             return Response({'error': 'Staff access required.'}, status=status.HTTP_403_FORBIDDEN)
 
         new_status = request.data.get('status')
+        if new_status not in dict(ServiceBooking.STATUS_CHOICES):
+            return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # FIELD_CREW: may only mark a booking Finished — all other transitions are admin-only
-        if not user.is_superuser:
-            try:
-                if user.staff_profile.role == 'FIELD_CREW' and new_status != 'Finished':
-                    return Response(
-                        {'error': 'Field crew members can only mark bookings as Finished.'},
-                        status=status.HTTP_403_FORBIDDEN,
-                    )
-            except Exception:
-                pass
+        booking = self.get_object()  # field crew only ever see their assigned bookings
+        is_office_admin = IsOfficeAdmin().has_permission(request, self)
 
+        if not is_office_admin:
+            if new_status != 'For Review':
+                return Response(
+                    {'error': 'Field crew can only submit work for sign-off. An office admin approves completion.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            if booking.status not in ('Preparing', 'Installing'):
+                return Response(
+                    {'error': f'Only active jobs can be submitted for sign-off (this one is {booking.status}).'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        booking.status = new_status
+        booking.save()
+
+        if new_status == 'For Review':
+            label = dict(ServiceBooking.SERVICE_CHOICES).get(booking.service_type, booking.service_type)
+            admins = User.objects.filter(is_active=True).filter(
+                Q(is_superuser=True) | Q(staff_profile__role='OFFICE_ADMIN')
+            ).distinct()
+            Notification.objects.bulk_create([
+                Notification(user=admin, message=(
+                    f"Booking #{booking.id} ({label}) was submitted as finished by "
+                    f"{user.get_full_name() or user.username} and is awaiting your sign-off."
+                ))
+                for admin in admins
+            ])
+        elif new_status == 'Finished':
+            _complete_tracker(booking, request.user, 'Signed off by office admin.')
+            _draft_portfolio(booking, request.user)
+
+        return Response({'status': new_status})
+
+    @action(detail=True, methods=['get', 'post'], url_path='progress-media')
+    def progress_media(self, request, pk=None):
+        """
+        GET  /api/bookings/<id>/progress-media/   before/during/after photos (crew, office, the customer)
+        POST /api/bookings/<id>/progress-media/   multipart: file, construction_phase, description  [staff]
+        Images are re-encoded to strip EXIF/GPS metadata before they are stored.
+        """
+        booking = self.get_object()  # crew: assigned only · customers: own only
+
+        if request.method == 'GET':
+            media = ProjectProgressMedia.objects.filter(project__booking=booking).select_related('uploader')
+            return Response(ProjectProgressMediaSerializer(media, many=True, context={'request': request}).data)
+
+        user = request.user
+        if not (user.is_staff or user.is_superuser):
+            return Response({'error': 'Only staff can upload progress photos.'}, status=status.HTTP_403_FORBIDDEN)
+        if booking.status in ('Finished', 'Cancelled') and not IsOfficeAdmin().has_permission(request, self):
+            return Response({'error': f'Booking #{booking.id} is {booking.status}; photos can no longer be added.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        phase = (request.data.get('construction_phase') or '').strip().upper()
+        if phase not in dict(ProjectProgressMedia.PHASE_CHOICES):
+            return Response({'error': "construction_phase must be BEFORE, DURING or AFTER."}, status=status.HTTP_400_BAD_REQUEST)
+        upload = request.FILES.get('file')
+        if not upload:
+            return Response({'error': 'A photo is required (field name: file).'}, status=status.HTTP_400_BAD_REQUEST)
+        clean, error = sanitize_image(upload)
+        if error:
+            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+        estimate = booking.design.total_cost if booking.design else 0
+        tracker, _ = ProjectTracker.objects.get_or_create(
+            booking=booking, defaults={'total_price': estimate, 'remaining_balance': estimate},
+        )
+        media = ProjectProgressMedia(
+            project=tracker, construction_phase=phase, uploader=user,
+            description=(request.data.get('description') or '').strip()[:500],
+        )
+        media.file_path.save(f'booking_{booking.id}_{phase.lower()}.jpg', clean, save=False)
+        media.save()
+        return Response(ProjectProgressMediaSerializer(media, context={'request': request}).data,
+                        status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['delete'], url_path=r'progress-media/(?P<media_id>\d+)')
+    def delete_progress_media(self, request, pk=None, media_id=None):
         booking = self.get_object()
-        if new_status in dict(ServiceBooking.STATUS_CHOICES):
-            booking.status = new_status
-            booking.save()
-            return Response({'status': new_status})
-        return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
+        media = get_object_or_404(ProjectProgressMedia, pk=media_id, project__booking=booking)
+        if not (media.uploader_id == request.user.id or IsOfficeAdmin().has_permission(request, self)):
+            return Response({'error': 'You can only delete photos you uploaded.'}, status=status.HTTP_403_FORBIDDEN)
+        if hasattr(media, 'portfolio_copy'):
+            return Response({'error': 'This photo is used in the project portfolio. Remove it there first.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        media.file_path.delete(save=False)
+        media.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['patch'], permission_classes=[IsAdminUser])
     def update_milestones(self, request, pk=None):
@@ -419,9 +502,9 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
 
         if booking.site_lat is not None and booking.site_lng is not None:
             dist_m = _haversine(lat, lng, booking.site_lat, booking.site_lng)
-            if dist_m > 50:
+            if dist_m > SITE_RADIUS_M:
                 return Response(
-                    {'error': f'You are {dist_m:.0f} m from the site. Must be within 50 m to check in.'},
+                    {'error': f'You are {dist_m:.0f} m from the site. Must be within {SITE_RADIUS_M} m to check in.'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
         else:
@@ -1196,11 +1279,12 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        qs = Order.objects.prefetch_related('items__item', 'items__review').order_by('-created_at')
         # Admins and staff can see all orders
         if self.request.user.is_staff or self.request.user.is_superuser:
-            return Order.objects.all().order_by('-created_at')
+            return qs
         # Standard users can only see their own orders
-        return Order.objects.filter(user=self.request.user).order_by('-created_at')
+        return qs.filter(user=self.request.user)
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1251,8 +1335,25 @@ def checkout(request):
     customer_address = data.get('customer_address')
     payment_method = data.get('payment_method', 'stripe')
     items_data = data.get('items', [])
-    total_price = data.get('total_price', 0)
+    # Any client-sent total_price is ignored: the server prices the order from the catalog.
+    # (Trusting it let a modified request pay ₱1 for any order.)
 
+    if payment_method not in dict(Order.PAYMENT_METHOD_CHOICES):
+        return Response({'error': 'Invalid payment method.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(items_data, list) or not items_data:
+        return Response({'error': 'Your cart is empty.'}, status=status.HTTP_400_BAD_REQUEST)
+    quantities = {}
+    for item_data in items_data:
+        try:
+            item_id = int(item_data['id'])
+            quantity = int(item_data.get('quantity', 1))
+        except (KeyError, TypeError, ValueError):
+            return Response({'error': 'Each item needs a numeric id and quantity.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not 1 <= quantity <= 999:
+            return Response({'error': 'Quantities must be between 1 and 999.'}, status=status.HTTP_400_BAD_REQUEST)
+        quantities[item_id] = quantities.get(item_id, 0) + quantity
+
+    shipping_fee = PricingSettings.current().shipping_fee
     try:
         with transaction.atomic():
             order = Order.objects.create(
@@ -1262,17 +1363,16 @@ def checkout(request):
                 customer_phone=customer_phone,
                 customer_address=customer_address,
                 payment_method=payment_method,
-                total_price=total_price
+                total_price=0,
             )
 
-            for item_data in items_data:
+            subtotal = 0
+            for item_id, quantity in quantities.items():
                 # select_for_update() locks the row until transaction ends, preventing race conditions
                 try:
-                    inventory_item = InventoryItem.objects.select_for_update().get(id=item_data['id'])
+                    inventory_item = InventoryItem.objects.select_for_update().get(id=item_id)
                 except InventoryItem.DoesNotExist:
-                    raise ValueError(f"Item with ID {item_data['id']} does not exist.")
-
-                quantity = item_data.get('quantity', 1)
+                    raise ValueError(f"Item with ID {item_id} does not exist.")
 
                 if inventory_item.stock_quantity < quantity:
                     raise ValueError(f"Insufficient stock for {inventory_item.name}. Available: {inventory_item.stock_quantity}")
@@ -1286,8 +1386,15 @@ def checkout(request):
                     quantity=quantity,
                     price_at_booking=inventory_item.unit_price
                 )
+                subtotal += inventory_item.unit_price * quantity
 
-        return Response({'message': 'Order successfully placed!', 'order_id': order.id}, status=status.HTTP_201_CREATED)
+            order.total_price = subtotal + shipping_fee
+            order.save(update_fields=['total_price'])
+
+        return Response({'message': 'Order successfully placed!', 'order_id': order.id,
+                         'subtotal': float(subtotal), 'shipping_fee': float(shipping_fee),
+                         'total_price': float(order.total_price)},
+                        status=status.HTTP_201_CREATED)
 
     except ValueError as e:
         return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -1313,8 +1420,14 @@ def create_checkout_session(request):
 
     try:
         order = Order.objects.get(id=order_id)
-    except Order.DoesNotExist:
+    except (Order.DoesNotExist, ValueError, TypeError):
         return Response({'error': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+    # Only the customer who placed an order can pay for it (guest orders have no owner)
+    if order.user_id and order.user_id != getattr(request.user, 'id', None):
+        return Response({'error': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+    if order.payment_status == 'Paid' or order.status == 'Cancelled':
+        return Response({'error': f'Order #{order.id} is already {order.payment_status if order.payment_status == "Paid" else "cancelled"}.'},
+                        status=status.HTTP_400_BAD_REQUEST)
 
     # Convert total_price from Philippine Peso to centavos (Stripe uses smallest currency unit)
     amount_centavos = int(order.total_price * 100)
@@ -1324,7 +1437,7 @@ def create_checkout_session(request):
         f"{frontend_url}/order-success"
         f"?order_id={order.id}"
         f"&total={order.total_price}"
-        f"&name={order.customer_name}"
+        f"&name={quote(order.customer_name or '')}"
     )
     cancel_url = f"{frontend_url}/studio"
 
@@ -1618,6 +1731,32 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             latitude = None
             longitude = None
 
+        # Clocking in to a job: it must be open, assigned to this crew member,
+        # and — when the site has a GPS pin — the crew member must be on site.
+        if booking_id:
+            from .models import ServiceBooking
+            try:
+                booking = ServiceBooking.objects.get(id=booking_id)
+            except (ServiceBooking.DoesNotExist, ValueError, TypeError):
+                return Response({'error': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+            if booking.status in ('For Review', 'Finished', 'Cancelled'):
+                return Response({'error': f'Booking #{booking.id} is {booking.status} and no longer open for work.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            role = getattr(getattr(user, 'staff_profile', None), 'role', None)
+            if role == 'FIELD_CREW' and not booking.assigned_crew.filter(pk=user.pk).exists():
+                return Response({'error': f'You are not assigned to Booking #{booking.id}.'},
+                                status=status.HTTP_403_FORBIDDEN)
+            if booking.site_lat is not None and booking.site_lng is not None:
+                if latitude is None or longitude is None:
+                    return Response({'error': 'Location is required to clock in to this job. Enable GPS and try again.'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                dist_m = _haversine(latitude, longitude, booking.site_lat, booking.site_lng)
+                if dist_m > SITE_RADIUS_M:
+                    return Response(
+                        {'error': f'You are {dist_m:.0f} m from the job site. You must be within {SITE_RADIUS_M} m to clock in.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
         try:
             with transaction.atomic():
                 attendance = Attendance(
@@ -1712,423 +1851,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
 
 # ───────────────────────────────────────────────────────────────
-# MOCK PLANT CATALOG & GEMINI GENERATION VIEW
+# AI Garden Designer — moved to garden_ai.py (hybrid Gemini + smart layout engine).
+# Re-exported here for existing imports.
 # ───────────────────────────────────────────────────────────────
-
-MOCK_PLANT_CATALOG = [
-    {"id": "tree_oak", "name": "Oak Tree", "price": 1200},
-    {"id": "flower_rose", "name": "Rose Flower", "price": 150},
-    {"id": "shrub_fern", "name": "Fern Shrub", "price": 250},
-    {"id": "tree_palm", "name": "Palm Tree", "price": 800},
-    {"id": "flower_lavender", "name": "Lavender Flower", "price": 180},
-    {"id": "shrub_boxwood", "name": "Boxwood Shrub", "price": 300},
-    {"id": "plant_bamboo", "name": "Bamboo Plant", "price": 450},
-    {"id": "plant_banana", "name": "Banana Plant", "price": 350},
-]
-
-class PlantArrangement(BaseModel):
-    plant_id: str
-    gx: int = Field(..., ge=0)   # grid column 0..GRID_COLS-1
-    gz: int = Field(..., ge=0)   # grid row    0..GRID_ROWS-1
-    rotation: float
-
-class PlantCostBreakdown(BaseModel):
-    plant_id: str
-    name: str
-    quantity: int
-    unit_price: int
-    subtotal: int
-
-class GardenDesignSchema(BaseModel):
-    design_name: str
-    reasoning: str
-    total_cost: int
-    plants: List[PlantArrangement]
-    plant_breakdown: List[PlantCostBreakdown]
-
-class LayoutResponse(BaseModel):
-    designs: List[GardenDesignSchema]
-
-
-_DESIGN_STYLES = ('Symmetrical', 'Minimalist', 'Lush / Organic')
-
-
-def _call_single_design(client, style: str, system_instruction: str, base_prompt: str, image_part) -> dict:
-    """Generate one garden design for *style*; safe to call from a thread pool."""
-    style_prompt = (
-        f"{base_prompt}\n"
-        f"Generate exactly ONE '{style}' garden design. Set the design_name field to '{style}'."
-    )
-    contents = [image_part, style_prompt] if image_part else style_prompt
-    last_err = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=contents,
-                config={
-                    "system_instruction": system_instruction,
-                    "response_mime_type": "application/json",
-                    "response_schema": GardenDesignSchema,
-                    "temperature": 0.4,
-                },
-            )
-            last_err = None
-            break
-        except APIError as e:
-            last_err = e
-            err_str = str(e)
-            if ('503' in err_str or 'UNAVAILABLE' in err_str or '429' in err_str) and attempt < MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)
-                continue
-            break
-    if last_err is not None:
-        raise last_err
-    if hasattr(response, 'parsed') and response.parsed is not None:
-        return response.parsed.model_dump()
-    return json.loads(response.text)
-
-
-class GenerateLayoutsView(APIView):
-    """
-    POST /api/generate-layouts/
-    Accepts:
-    - budget: int (required)
-    - preferred_plant_ids: list of str (optional)
-
-    Generates 3 distinct garden design options using Gemini 2.5 (3 parallel calls).
-    Guest users receive the generated JSON without it being saved to the database.
-    """
-    permission_classes = [AllowAny]
-
-    def post(self, request, *args, **kwargs):
-        # 1. Parse request body
-        try:
-            data = request.data
-        except Exception:
-            return Response(
-                {"error": "Invalid request body. Expected JSON or multipart/form-data."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        budget = data.get("budget")
-        lot_width = data.get("lot_width")
-        lot_length = data.get("lot_length")
-        preferred_plant_ids_raw = data.get("preferred_plant_ids", [])
-
-        # 2. Validate inputs
-        if budget is None:
-            return Response(
-                {"error": "Budget is a required field."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        if lot_width is None:
-            return Response(
-                {"error": "Lot width (lot_width) is a required field."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        if lot_length is None:
-            return Response(
-                {"error": "Lot length (lot_length) is a required field."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            budget_int = int(budget)
-            if budget_int <= 0:
-                raise ValueError()
-        except (ValueError, TypeError):
-            return Response(
-                {"error": "Budget must be a positive integer."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # 45% of the total budget is available for plant & material costs.
-        # The remaining 55% covers labor (35%) and service/markup (20%).
-        plant_budget_int = int(budget_int * 0.45)
-        plant_budget_floor = int(plant_budget_int * 0.75)
-
-        try:
-            lot_width_float = float(lot_width)
-            lot_length_float = float(lot_length)
-            if lot_width_float <= 0.0 or lot_length_float <= 0.0:
-                raise ValueError()
-        except (ValueError, TypeError):
-            return Response(
-                {"error": "Lot width and lot length must be positive numbers."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Parse preferred_plant_ids (could be stringified JSON array if multipart)
-        preferred_plant_ids = []
-        if preferred_plant_ids_raw:
-            if isinstance(preferred_plant_ids_raw, str):
-                try:
-                    preferred_plant_ids = json.loads(preferred_plant_ids_raw)
-                except Exception:
-                    return Response(
-                        {"error": "preferred_plant_ids must be a valid JSON array string."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            elif isinstance(preferred_plant_ids_raw, list):
-                preferred_plant_ids = preferred_plant_ids_raw
-            else:
-                return Response(
-                    {"error": "preferred_plant_ids must be a list or a JSON array string."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-        # Extract optional image — Vision-then-Math pipeline:
-        # 1. Vision AI identifies placement zones only (< 100-token response)
-        # 2. resolve_coordinates() maps zones → grid cells (pure Python math)
-        # 3. Layout AI receives excluded cell list in text — no image bytes needed
-        image_file = request.FILES.get('image')
-        image_part = None          # layout calls are text-only after zone resolution
-        existing_elements = []     # [{zone, label, x, z, blocks_planting, is_existing}]
-        excluded_cells: set = set()
-
-        if image_file:
-            try:
-                from .utils import scan_image_for_existing_elements, resolve_coordinates
-                zone_elements = scan_image_for_existing_elements(image_file)
-
-                for elem in zone_elements:
-                    coords = resolve_coordinates(
-                        elem['zone'], lot_width_float, lot_length_float
-                    )
-                    existing_elements.append({
-                        **elem,
-                        'x': coords['x'],
-                        'z': coords['z'],
-                    })
-                    if elem.get('blocks_planting', True):
-                        excluded_cells.update(coords['excluded_cells'])
-
-            except Exception as e:
-                logger.exception("Failed during Vision zone scan.")
-                return Response(
-                    {"error": f"Failed to process uploaded image: {str(e)}"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-        # 3. Check for Gemini API key
-        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not api_key or api_key == "your_gemini_api_key_here":
-            logger.error("Gemini/Google API key is not configured or is the default placeholder in environment.")
-            return Response(
-                {"error": "Gemini/Google API key is not configured on the server. Please check environment configuration."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE
-            )
-
-        # 4. Construct client and prompt
-        try:
-            client = genai.Client(api_key=api_key)
-        except Exception as e:
-            logger.exception("Failed to initialize GenAI client.")
-            return Response(
-                {"error": f"Failed to initialize AI Client: {str(e)}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-        # Query plant inventory from database early so it's available for both prompt and validation
-        available_plants = list(InventoryItem.objects.filter(category='plant'))
-        catalog_ids = {str(p.id) for p in available_plants}
-        plant_price_map = {str(p.id): float(p.unit_price) for p in available_plants}
-
-        # Fail-safe budget guard — warn when plant budget can't cover minimum lot density
-        _prices = [float(p.unit_price) for p in available_plants]
-        _cheapest = min(_prices) if _prices else 200.0
-        _lot_area = lot_width_float * lot_length_float
-        _min_plants = max(5, int(_lot_area / 15))
-        _min_viable = _min_plants * _cheapest
-        _budget_warning = None
-        if plant_budget_int < _min_viable:
-            _budget_warning = (
-                "Budget may be too tight for an area of this size. "
-                "Consider increasing your budget or choosing low-cost flora."
-            )
-
-        # Build system instruction — zone exclusions injected as exact grid cells,
-        # not fuzzy coordinate radii. Vision AI already did the image analysis.
-        system_instruction = (
-            "You are an expert landscape architect. Your primary goal is to maximise plant density "
-            "within the user's budget — treat the budget as a TARGET, not a ceiling. "
-            "Keep adding plants and upgrading to higher-value specimens until total_cost is as "
-            "close to the budget as possible WITHOUT going over. "
-            "Aim for at least 75% of the budget. A design using only 30% is a failure.\n\n"
-            "Generate ONE garden design layout of the style named in the user prompt. "
-            "Layout the selected plants logically across the coordinate grid. "
-            f"All plants must use integer grid indices: "
-            f"gx in 0..{GRID_COLS-1} (column), gz in 0..{GRID_ROWS-1} (row). "
-            "The backend expands these to real metres — never output float x/z coordinates. "
-            "Rotation must be between 0.0 and 360.0 degrees. "
-            "Total cost must not exceed the specified budget. "
-            "Make the design distinct and creative.\n\n"
-        )
-
-        if excluded_cells:
-            excl_str = ', '.join(f"({gx},{gz})" for gx, gz in sorted(excluded_cells))
-            system_instruction += (
-                f"OCCUPIED CELLS — DO NOT PLACE PLANTS HERE: {excl_str}\n"
-                "These cells contain existing structures identified from the site photo. "
-                "Place new plants only in cells NOT on this list.\n\n"
-            )
-
-        system_instruction += (
-            "REASONING (MANDATORY): Fill 'reasoning' with 1-2 sentences explaining your choices — "
-            "plant selection, layout, spacing, budget targeting, and any site constraints.\n\n"
-            "COST BREAKDOWN (MANDATORY): Fill 'plant_breakdown' with itemised costs: "
-            "plant_id, name, quantity, unit_price, subtotal. Sum of subtotals must equal total_cost.\n\n"
-            "PLANT ID (MANDATORY): Every plant_id must be an exact integer ID string from the "
-            "Provided Plant Catalog. Never invent IDs. Invented IDs are auto-discarded."
-        )
-
-        # Text summary of site context for the user prompt (no image bytes needed)
-        photo_emphasis = ""
-        if existing_elements:
-            site_features = ', '.join(
-                f"{e['label']} ({e['zone']})" for e in existing_elements
-            )
-            photo_emphasis = f"\nSite analysis from reference photo: {site_features}.\n"
-
-        # Build text-based catalog for the prompt
-        catalog_text = ""
-        for plant in available_plants:
-            desc = f" ({plant.description})" if plant.description else ""
-            catalog_text += f"- ID: '{plant.id}', Name: '{plant.name}', Cost: {int(plant.unit_price)} PHP{desc}\n"
-
-        user_prompt = f"""
-Provided Plant Catalog:
-{catalog_text}
-
-User Budget & Lot Constraints:
-Plant & Material Budget: ₱{plant_budget_int} (spend between ₱{plant_budget_floor} and ₱{plant_budget_int})
-Grid layout: {GRID_COLS}×{GRID_ROWS} cells spanning {lot_width_float}m × {lot_length_float}m
-  gx 0..{GRID_COLS-1} → x 0..{lot_width_float}m | gz 0..{GRID_ROWS-1} → z 0..{lot_length_float}m
-Preferred Plant IDs (prioritize these): {json.dumps(preferred_plant_ids)}
-{photo_emphasis}
-BUDGET RULE: The design's total_cost MUST be between ₱{plant_budget_floor} and ₱{plant_budget_int}.
-Maximise plant count and use higher-value specimens to reach this range.
-The plant_id field in your response for each plant MUST be the database ID (integer string) of the chosen plant from the provided catalog.
-Generate a single complete garden design layout.
-"""
-        # 5. Cache check — skip for image requests (site-specific, not cacheable)
-        cache_key = None
-        if not image_file:
-            cache_key = _make_cache_key(budget_int, lot_width_float, lot_length_float, preferred_plant_ids)
-            cached_data = _get_cached(cache_key)
-            if cached_data is not None:
-                logger.info("Returning cached layout (key=%s)", cache_key)
-                # Attach the current budget_warning (lot/budget check is instant — not cached)
-                cached_data["budget_warning"] = _budget_warning
-                return Response(cached_data, status=status.HTTP_200_OK)
-
-        # 6. Fire 3 parallel single-design calls via thread pool
-        designs_raw: list = []
-        call_errors: list = []
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            future_map = {
-                pool.submit(
-                    _call_single_design, client, style,
-                    system_instruction, user_prompt, image_part
-                ): style
-                for style in _DESIGN_STYLES
-            }
-            for future in as_completed(future_map):
-                style = future_map[future]
-                try:
-                    designs_raw.append(future.result())
-                except Exception as exc:
-                    logger.error("Design '%s' generation failed: %s", style, exc)
-                    call_errors.append(str(exc))
-
-        if not designs_raw:
-            joined = ' '.join(call_errors)
-            if '503' in joined or 'UNAVAILABLE' in joined:
-                msg = "The AI service is temporarily overloaded. Please wait a moment and try again."
-            elif '429' in joined:
-                msg = "Too many requests to the AI service. Please wait a moment and try again."
-            else:
-                msg = "The AI service returned an error. Please try again."
-            logger.error("All parallel Gemini calls failed: %s", joined)
-            return Response({"error": msg}, status=status.HTTP_502_BAD_GATEWAY)
-
-        response_data = {"designs": designs_raw, "budget_warning": _budget_warning}
-
-        # 7. Validate plant IDs — strip any the AI invented that aren't in our catalog
-        if isinstance(response_data, dict) and "designs" in response_data:
-            for design in response_data["designs"]:
-                raw_plants = design.get("plants") if isinstance(design.get("plants"), list) else []
-                validated = [p for p in raw_plants if str(p.get("plant_id", "")) in catalog_ids]
-                # Expand compressed gx/gz grid indices → real-world x/z metres
-                design["plants"] = _expand_grid_coords(validated, lot_width_float, lot_length_float)
-                recalculated_cost = sum(
-                    plant_price_map.get(str(p.get("plant_id", "")), 0)
-                    for p in validated
-                )
-                plant_cost = recalculated_cost
-                full_cost = round(plant_cost / 0.45) if plant_cost > 0 else 0
-                design["plant_cost"] = plant_cost
-                design["total_cost"] = full_cost
-                design["cost_breakdown"] = {
-                    "plants": plant_cost,
-                    "labor": round(full_cost * 0.35),
-                    "service": round(full_cost * 0.20),
-                    "total": full_cost,
-                }
-
-                # Reconstruct and ensure 100% correct plant_breakdown matching the validated plants
-                from collections import Counter
-                plant_counts = Counter(str(p.get("plant_id", "")) for p in validated if not p.get("is_existing"))
-                
-                recalculated_breakdown = []
-                for pid, qty in plant_counts.items():
-                    db_item = next((item for item in available_plants if str(item.id) == pid), None)
-                    if db_item:
-                        price = int(db_item.unit_price)
-                        recalculated_breakdown.append({
-                            "plant_id": pid,
-                            "name": db_item.name,
-                            "quantity": qty,
-                            "unit_price": price,
-                            "subtotal": price * qty
-                        })
-                design["plant_breakdown"] = recalculated_breakdown
-                # Flag designs where plant budget utilisation is under 50%
-                if recalculated_cost < plant_budget_int * 0.5:
-                    design["density_note"] = "increase plant density"
-                    logger.warning(
-                        "Design '%s' uses only %.0f%% of plant budget (₱%.0f / ₱%d). Flagged for low density.",
-                        design.get("design_name", "?"),
-                        recalculated_cost / plant_budget_int * 100 if plant_budget_int else 0,
-                        recalculated_cost, plant_budget_int
-                    )
-
-        # Merge existing elements into each design's plant list
-        if isinstance(response_data, dict) and "designs" in response_data:
-            for design in response_data["designs"]:
-                if "plants" not in design or not isinstance(design["plants"], list):
-                    design["plants"] = []
-
-                for elem in existing_elements:
-                    merged_item = dict(elem)
-                    # Ensure plant_id exists so the frontend renderer never errors
-                    if "plant_id" not in merged_item:
-                        merged_item["plant_id"] = (
-                            merged_item.get("type")
-                            or merged_item.get("zone")
-                            or "existing_element"
-                        )
-                    merged_item["is_existing"] = True
-                    if "rotation" not in merged_item:
-                        merged_item["rotation"] = 0.0
-                    design["plants"].append(merged_item)
-
-        # Write to cache for image-free requests before returning
-        if cache_key is not None:
-            _set_cached(cache_key, response_data)
-
-        return Response(response_data, status=status.HTTP_200_OK)
+from .garden_ai import (  # noqa: E402,F401
+    AILayoutThrottle, GardenDesignSchema, GenerateLayoutsView, PlantArrangement, PlantCostBreakdown,
+)
 
 
 class ServiceReviewViewSet(viewsets.ModelViewSet):
@@ -2152,12 +1880,51 @@ class ServiceReviewViewSet(viewsets.ModelViewSet):
     def public(self, request):
         reviews = (
             ServiceReview.objects
-            .filter(is_public=True)
+            .filter(is_public=True, is_hidden=False)
             .select_related('booking', 'user')
             .prefetch_related('booking__assigned_crew')
             .order_by('-created_at')[:12]
         )
         serializer = self.get_serializer(reviews, many=True)
+        return Response(serializer.data)
+
+
+class ProductReviewViewSet(viewsets.ModelViewSet):
+    """
+    GET  /api/product-reviews/                      Own reviews (staff/admin → all)
+    POST /api/product-reviews/                      Review a delivered order item
+    GET  /api/product-reviews/public/?product=<id>  Public reviews, optionally for one product
+    """
+    serializer_class = ProductReviewSerializer
+    http_method_names = ['get', 'post', 'head', 'options']
+
+    def get_permissions(self):
+        if self.action == 'public':
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return ProductReview.objects.none()
+        qs = ProductReview.objects.select_related('product', 'user', 'order_item')
+        if user.is_staff or user.is_superuser:
+            return qs.all()
+        return qs.filter(user=user)
+
+    @action(detail=False, methods=['get'], permission_classes=[AllowAny])
+    def public(self, request):
+        reviews = (
+            ProductReview.objects
+            .filter(is_public=True, is_hidden=False)
+            .select_related('product', 'user', 'order_item')
+        )
+        product_id = request.query_params.get('product')
+        if product_id:
+            if not product_id.isdigit():
+                return Response({'error': 'product must be a numeric id.'}, status=status.HTTP_400_BAD_REQUEST)
+            reviews = reviews.filter(product_id=product_id)
+        serializer = self.get_serializer(reviews.order_by('-created_at')[:20], many=True)
         return Response(serializer.data)
 
 
@@ -2201,7 +1968,7 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         # Write operations (create / edit / status advance) require admin/staff
-        if self.action in ('create', 'update', 'partial_update', 'destroy', 'update_status'):
+        if self.action in ('create', 'update', 'partial_update', 'destroy', 'update_status', 'record_payment'):
             return [IsAuthenticated(), IsOfficeAdmin()]
         return [IsAuthenticated()]
 
@@ -2213,6 +1980,15 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
             trigger_user=self.request.user,
             remarks='Project tracker initialized.',
         )
+
+    def perform_update(self, serializer):
+        old_price = serializer.instance.total_price
+        tracker = serializer.save()
+        if tracker.total_price != old_price:
+            ProjectHistoryLog.objects.create(
+                project=tracker, status_reached=tracker.status, trigger_user=self.request.user,
+                remarks=f"Contract price changed: ₱{old_price:,.2f} → ₱{tracker.total_price:,.2f}",
+            )
 
     # ── GET /api/projects/supervisor-options/ ────────────────────────────────
     @action(detail=False, methods=['get'], url_path='supervisor-options')
@@ -2259,6 +2035,14 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
             remarks=remarks,
         )
 
+        # Completing the project from the tracker is the same office-admin sign-off
+        # as approving the booking, so keep the booking status in step.
+        booking = tracker.booking
+        if new_status in ('COMPLETED', 'CUSTOMER_FEEDBACK') and booking.status not in ('Finished', 'Cancelled'):
+            booking.status = 'Finished'
+            booking.save()
+            _draft_portfolio(booking, request.user)
+
         logger.info(
             "ProjectTracker #%s: %s → %s by user #%s",
             tracker.pk, previous_status, new_status, request.user.pk,
@@ -2268,6 +2052,34 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
             tracker, context={'request': request}
         )
         return Response(serializer.data)
+
+    # ── POST /api/projects/<id>/record-payment/ ──────────────────────────────
+    @action(detail=True, methods=['post'], url_path='record-payment')
+    def record_payment(self, request, pk=None):
+        """Reduce the remaining balance and keep an audit entry for the payment."""
+        from decimal import Decimal, InvalidOperation
+        tracker = self.get_object()
+        try:
+            amount = Decimal(str(request.data.get('amount'))).quantize(Decimal('0.01'))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({'error': 'amount must be a number.'}, status=status.HTTP_400_BAD_REQUEST)
+        if amount <= 0:
+            return Response({'error': 'amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+        if amount > tracker.remaining_balance:
+            return Response(
+                {'error': f'amount exceeds the remaining balance of ₱{tracker.remaining_balance:,.2f}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        tracker.remaining_balance -= amount
+        tracker.save()
+        note = (request.data.get('remarks') or '').strip()
+        ProjectHistoryLog.objects.create(
+            project=tracker, status_reached=tracker.status, trigger_user=request.user,
+            remarks=f"Payment received: ₱{amount:,.2f} (balance ₱{tracker.remaining_balance:,.2f})"
+                    + (f" — {note}" if note else ''),
+        )
+        return Response(ProjectTrackerSerializer(tracker, context={'request': request}).data)
 
     # ── POST /api/projects/<id>/upload-media/ ────────────────────────────────
     @action(detail=True, methods=['post'], url_path='upload-media')
@@ -2280,6 +2092,9 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
             )
 
         tracker = self.get_object()
+        role = getattr(getattr(request.user, 'staff_profile', None), 'role', None)
+        if role == 'FIELD_CREW' and not tracker.booking.assigned_crew.filter(pk=request.user.pk).exists():
+            return Response({'error': 'You are not assigned to this project.'}, status=status.HTTP_403_FORBIDDEN)
 
         construction_phase = (
             request.data.get('construction_phase') or ''
@@ -2299,14 +2114,19 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        media = ProjectProgressMedia.objects.create(
+        clean, error = sanitize_image(file_obj)  # strips EXIF/GPS metadata
+        if error:
+            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+        media = ProjectProgressMedia(
             project=tracker,
             construction_phase=construction_phase,
-            file_path=file_obj,
             uploader=request.user,
             description=description,
             location=location,
         )
+        media.file_path.save(f'project_{tracker.id}_{construction_phase.lower()}.jpg', clean, save=False)
+        media.save()
 
         serializer = ProjectProgressMediaSerializer(
             media, context={'request': request}

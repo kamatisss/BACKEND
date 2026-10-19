@@ -62,6 +62,8 @@ class GardenDesign(models.Model):
     dimensions = models.JSONField(default=dict, blank=True,
                                   help_text="{width, length, terrain_type}")
     total_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    # Snapshot of the estimate (lines + rates) the customer saw — rate changes never rewrite it
+    cost_estimate = models.JSONField(default=dict, blank=True)
     terrain_height = models.FloatField(default=1.5)
     time_of_day = models.FloatField(default=14.0)
     STATUS_CHOICES = [
@@ -113,6 +115,8 @@ class ServiceBooking(models.Model):
         ('Pending',    'Pending'),
         ('Preparing',  'Preparing'),
         ('Installing', 'Installing'),
+        # Field crew submit finished work here; an office admin signs it off → Finished
+        ('For Review', 'Awaiting Sign-off'),
         ('Finished',   'Finished'),
         ('Cancelled',  'Cancelled'),
     ]
@@ -442,7 +446,263 @@ class ProjectProgressMedia(models.Model):
         )
 
 
-class ServiceReview(models.Model):
+class PortfolioProject(models.Model):
+    """
+    A finished landscape job curated for the public Project Hub (portfolio).
+    Drafted automatically when an office admin signs a booking off; only
+    published once the customer has given consent (see PortfolioConsent).
+    """
+    STATUS_CHOICES = [
+        ('draft',     'Draft'),
+        ('published', 'Published'),
+        ('archived',  'Archived'),
+    ]
+
+    booking = models.OneToOneField(ServiceBooking, on_delete=models.CASCADE, related_name='portfolio')
+    title = models.CharField(max_length=120)
+    slug = models.SlugField(max_length=140, unique=True)
+    summary = models.CharField(max_length=300, blank=True, default='')
+    story = models.TextField(blank=True, default='')
+    style_tags = models.JSONField(default=list, blank=True, help_text='e.g. ["Tropical", "Low maintenance"]')
+
+    # Public display facts — never the street address or the exact price
+    city = models.CharField(max_length=80, blank=True, default='')
+    lot_area_sqm = models.FloatField(null=True, blank=True)
+    price_band = models.CharField(max_length=40, blank=True, default='')
+    started_on = models.DateField(null=True, blank=True)
+    completed_on = models.DateField(null=True, blank=True)
+
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default='draft')
+    is_featured = models.BooleanField(default=False)
+    cover = models.ForeignKey('PortfolioMedia', on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    view_count = models.PositiveIntegerField(default=0)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    published_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-completed_on', '-created_at']
+
+    def __str__(self):
+        return f"Portfolio: {self.title} [{self.status}]"
+
+
+class PortfolioMedia(models.Model):
+    KIND_CHOICES = [
+        ('before', 'Before'),
+        ('during', 'During'),
+        ('after',  'After'),
+        ('detail', 'Detail'),
+        ('render', '3D design render'),  # snapshot of the customer's 3D design, for Design vs Reality
+    ]
+
+    project = models.ForeignKey(PortfolioProject, on_delete=models.CASCADE, related_name='media')
+    image = models.ImageField(upload_to='portfolio/%Y/%m/')
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES, default='after')
+    caption = models.CharField(max_length=200, blank=True, default='')
+    # Imported crew photos start hidden; the admin chooses what goes public
+    is_public = models.BooleanField(default=False)
+    # Flagged by the admin; hidden publicly unless the customer allowed house photos
+    shows_house = models.BooleanField(default=False)
+    sort_order = models.PositiveIntegerField(default=0)
+    source = models.OneToOneField(
+        ProjectProgressMedia, on_delete=models.SET_NULL, null=True, blank=True, related_name='portfolio_copy',
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+
+    def __str__(self):
+        return f"PortfolioMedia#{self.pk} [{self.kind}] for {self.project_id}"
+
+
+class PortfolioConsent(models.Model):
+    """The customer's permission to feature their garden (Data Privacy Act, RA 10173)."""
+    STATUS_CHOICES = [
+        ('pending',   'Awaiting response'),
+        ('granted',   'Granted'),
+        ('declined',  'Declined'),
+        ('withdrawn', 'Withdrawn'),
+    ]
+    NAME_CHOICES = [
+        ('initials',  'First name and last initial'),
+        ('anonymous', 'Anonymous'),
+    ]
+
+    project = models.OneToOneField(PortfolioProject, on_delete=models.CASCADE, related_name='consent')
+    customer = models.ForeignKey(User, on_delete=models.CASCADE, related_name='portfolio_consents')
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    name_display = models.CharField(max_length=10, choices=NAME_CHOICES, default='initials')
+    show_house = models.BooleanField(default=True, help_text='Customer allows photos where the house is visible')
+    include_review = models.BooleanField(default=True)
+    requested_at = models.DateTimeField(auto_now_add=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Consent[{self.status}] for {self.project_id}"
+
+
+class BusinessCredential(models.Model):
+    """
+    A permit, registration, certification or award shown on the public Track
+    Record page. Entered by an office admin — nothing here is generated.
+    """
+    KIND_CHOICES = [
+        ('registration',  'Business registration'),
+        ('permit',        'Permit / license'),
+        ('certification', 'Certification'),
+        ('award',         'Award'),
+        ('partnership',   'Partnership / membership'),
+    ]
+
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES, default='permit')
+    title = models.CharField(max_length=150, help_text="e.g. Mayor's Permit, DTI Business Name Registration")
+    issuer = models.CharField(max_length=150, blank=True, default='', help_text='e.g. City of Lucena, BIR, DTI')
+    reference_no = models.CharField(max_length=80, blank=True, default='')
+    show_reference_no = models.BooleanField(default=False)
+    issued_on = models.DateField(null=True, blank=True)
+    expires_on = models.DateField(null=True, blank=True)
+    document = models.FileField(upload_to='credentials/', null=True, blank=True)
+    show_document = models.BooleanField(default=False, help_text='Let visitors view the uploaded document')
+    is_public = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'kind', 'title']
+
+    def __str__(self):
+        return f"{self.get_kind_display()}: {self.title}"
+
+
+class PricingSettings(models.Model):
+    """
+    The business's rate card (one row). Every estimate — AI Designer, Studio, shop
+    delivery — is built from these rates. The defaults are SAMPLE rates: `is_sample`
+    stays True until an admin saves real ones, and the admin screen says so.
+    """
+    # Planting labour per plant, by size class (see layout_engine.PlantSpec.layer)
+    planting_tall = models.DecimalField(max_digits=10, decimal_places=2, default=350,
+                                        help_text='Trees & palms (2.5 m+), per plant')
+    planting_mid = models.DecimalField(max_digits=10, decimal_places=2, default=120,
+                                       help_text='Shrubs (0.8–2.5 m), per plant')
+    planting_low = models.DecimalField(max_digits=10, decimal_places=2, default=40,
+                                       help_text='Flowers & groundcover, per plant')
+    install_other = models.DecimalField(max_digits=10, decimal_places=2, default=100,
+                                        help_text='Placing stones, furniture and other items, per item')
+    # Per square metre of the garden area
+    site_prep_per_sqm = models.DecimalField(max_digits=10, decimal_places=2, default=150,
+                                            help_text='Clearing, levelling, soil preparation')
+    materials_per_sqm = models.DecimalField(max_digits=10, decimal_places=2, default=120,
+                                            help_text='Garden soil, compost, mulch')
+    # Per project
+    mobilization_fee = models.DecimalField(max_digits=10, decimal_places=2, default=1500,
+                                           help_text='Crew transport & delivery within the service area')
+    service_area = models.CharField(max_length=200, blank=True, default='Lucena City and nearby towns')
+    design_fee_percent = models.DecimalField(max_digits=5, decimal_places=2, default=10,
+                                             help_text='Design & project management, % of the subtotal')
+    minimum_project = models.DecimalField(max_digits=12, decimal_places=2, default=15000)
+    estimate_range_percent = models.DecimalField(max_digits=5, decimal_places=2, default=10,
+                                                 help_text='Estimates are shown as ± this %')
+    vat_registered = models.BooleanField(default=False)
+    vat_percent = models.DecimalField(max_digits=5, decimal_places=2, default=12)
+    # Shop
+    shipping_fee = models.DecimalField(max_digits=10, decimal_places=2, default=150,
+                                       help_text='Flat delivery fee per shop order')
+
+    is_sample = models.BooleanField(default=True, help_text='True until an admin saves real rates')
+    updated_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'pricing settings'
+        verbose_name_plural = 'pricing settings'
+
+    def __str__(self):
+        return 'Rate card' + (' (sample rates)' if self.is_sample else '')
+
+    @classmethod
+    def current(cls):
+        obj, created = cls.objects.get_or_create(pk=1)
+        if created:
+            obj.refresh_from_db()  # defaults are plain numbers until read back as Decimals
+        return obj
+
+
+class LayoutGenerationLog(models.Model):
+    """
+    One AI Designer request: did Gemini answer, or did the smart layout engine
+    cover for it? Feeds the admin "AI Designer health" view.
+    """
+    AI_STATUS_CHOICES = [
+        ('ok',          'AI design generated'),
+        ('cached',      'Served from cache'),
+        ('error',       'AI failed — smart layouts used'),
+        ('quota',       'Gemini daily limit reached — smart layouts used'),
+        ('unavailable', 'AI paused after recent failures — smart layouts used'),
+        ('user_quota',  "Customer's daily AI designs used — smart layouts used"),
+        ('disabled',    'AI off (engine-only mode or no API key)'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    ai_status = models.CharField(max_length=12, choices=AI_STATUS_CHOICES)
+    zone_scan = models.CharField(max_length=16, blank=True, default='')  # ok / none / failed / customer
+    adjustments = models.PositiveSmallIntegerField(default=0)            # repair notes on the AI design
+    duration_ms = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Layout run {self.ai_status} ({self.duration_ms} ms)"
+
+
+class FunnelEvent(models.Model):
+    """
+    One step of the guest 3D Studio → sign-up funnel, counted once per browser
+    session. Anonymous by design: a random session id, no IP or personal data.
+    """
+    EVENT_CHOICES = [
+        ('studio_opened',      'Opened the free 3D Studio'),
+        ('first_item_placed',  'Placed a first item'),
+        ('ai_teaser_clicked',  'Clicked "Let AI design it"'),
+        ('save_clicked',       'Tried to save / photo / checkout'),
+        ('account_created',    'Created an account from the Studio'),
+        ('signed_in',          'Signed in from the Studio'),
+    ]
+
+    name = models.CharField(max_length=30, choices=EVENT_CHOICES)
+    session_id = models.CharField(max_length=40)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('session_id', 'name')
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} [{self.session_id[:8]}]"
+
+
+class ReviewModeration(models.Model):
+    """
+    Office moderation shared by service and product reviews. `is_public` stays the
+    customer's own choice; staff can hide a public review but never publish a private one.
+    """
+    is_hidden = models.BooleanField(default=False, help_text='Hidden by an office admin (spam, abuse, personal data)')
+    is_featured = models.BooleanField(default=False, help_text='Pinned to the landing page carousel')
+    reply = models.TextField(blank=True, default='', help_text='Public response from the business')
+    replied_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+
+class ServiceReview(ReviewModeration):
     booking = models.OneToOneField(
         ServiceBooking, on_delete=models.CASCADE, related_name='review'
     )
@@ -459,3 +719,29 @@ class ServiceReview(models.Model):
 
     def __str__(self):
         return f"Review by {self.user.username} for Booking #{self.booking_id} ({self.rating}★)"
+
+
+class ProductReview(ReviewModeration):
+    """Customer review of one purchased product, allowed once the order is Delivered."""
+    # One review per purchased line — buying the same product again allows a new review
+    order_item = models.OneToOneField(
+        OrderItem, on_delete=models.CASCADE, related_name='review'
+    )
+    # Denormalized from order_item.item so product ratings can be aggregated directly
+    product = models.ForeignKey(
+        InventoryItem, on_delete=models.SET_NULL, null=True, related_name='reviews'
+    )
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='product_reviews')
+    rating = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
+    comment = models.TextField(blank=True, default='')
+    is_public = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        product_name = self.product.name if self.product else "Deleted Item"
+        return f"Review by {self.user.username} for {product_name} ({self.rating}★)"

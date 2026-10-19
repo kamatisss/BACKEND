@@ -8,7 +8,9 @@ import numpy as np
 import cv2
 from PIL import Image, ImageFilter, ImageOps, ImageEnhance
 from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.throttling import UserRateThrottle
 from django.core.files.storage import default_storage
 
 logger = logging.getLogger(__name__)
@@ -302,7 +304,14 @@ def _to_pil_gray(arr):
 # ───────────────────────────────────────────────────────────────
 # MAIN ENDPOINT
 # ───────────────────────────────────────────────────────────────
-@csrf_exempt
+class DepthMapThrottle(UserRateThrottle):
+    """Photo-to-terrain runs a heavy local model, so it's limited per account (settings: 'depth_maps')."""
+    scope = 'depth_maps'
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([DepthMapThrottle])
 def generate_depth(request):
     """
     Hybrid 3D pipeline:

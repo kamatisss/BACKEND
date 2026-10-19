@@ -11,17 +11,12 @@ logger = logging.getLogger(__name__)
 # The Vision AI outputs only a zone label (< 100 tokens).
 # resolve_coordinates() converts that label into exact grid cells —
 # all spatial math stays in Python, not in the AI generation step.
-
-ZONE_GRID: dict = {
-    'background_perimeter': {'gx': (0,  19), 'gz': (15, 19)},
-    'midground_left':       {'gx': (0,   6), 'gz': (8,  14)},
-    'midground_center':     {'gx': (7,  12), 'gz': (8,  14)},
-    'midground_right':      {'gx': (13, 19), 'gz': (8,  14)},
-    'foreground_left':      {'gx': (0,   6), 'gz': (2,   7)},
-    'foreground_center':    {'gx': (7,  12), 'gz': (2,   7)},
-    'foreground_right':     {'gx': (13, 19), 'gz': (2,   7)},
-    'blocked':              {'gx': (6,  13), 'gz': (7,  12)},
-}
+#
+# Single source of truth: the layout engine's map, where gz 0 is the back of the
+# garden and gz 19 the front (nearest the viewer in the 3D/AR view). The previous
+# local map had front and back swapped, so detected obstacles were kept clear on
+# the wrong side of the garden.
+from .layout_engine import ZONES as ZONE_GRID
 
 _VALID_ZONES = set(ZONE_GRID.keys())
 _GRID_COLS = 20
@@ -71,6 +66,54 @@ def resolve_coordinates(
         'z': round(gz_center * cell_l, 3),
         'excluded_cells': excluded,
     }
+
+
+ZONE_SCAN_PROMPT = None  # set below, shared by both scan functions
+
+
+def scan_image_zones(image_file, timeout_ms=20_000):
+    """
+    Like scan_image_for_existing_elements, but reports failures instead of hiding them.
+
+    Returns (zones, error): zones is [{zone, label, blocks_planting, is_existing}];
+    error is None on success, or a short reason ('no_key', 'quota', 'unavailable', 'bad_response').
+    An empty zones list with error None genuinely means "nothing found".
+    """
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key or api_key == "your_gemini_api_key_here":
+        return [], 'no_key'
+    try:
+        if hasattr(image_file, 'read'):
+            image_file.seek(0)
+            image_bytes = image_file.read()
+            image_file.seek(0)
+            mime_type = getattr(image_file, 'content_type', 'image/jpeg') or 'image/jpeg'
+        else:
+            image_bytes, mime_type = image_file, 'image/jpeg'
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_ms))
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                      "List each existing garden feature with its placement zone as JSON."],
+            config={"system_instruction": ZONE_SCAN_PROMPT, "response_mime_type": "application/json", "temperature": 0.1},
+        )
+    except Exception as e:  # network, timeout, quota…
+        text = str(e)
+        logger.warning("Zone scan failed: %s", text[:200])
+        return [], 'quota' if ('429' in text or 'RESOURCE_EXHAUSTED' in text) else 'unavailable'
+    try:
+        cleaned = (response.text or '').strip().removeprefix('```json').removesuffix('```').strip()
+        parsed = json.loads(cleaned or '[]')
+        if not isinstance(parsed, list):
+            raise ValueError('not a list')
+    except (ValueError, json.JSONDecodeError):
+        return [], 'bad_response'
+    zones = [
+        {'zone': item.get('zone'), 'label': item.get('label', 'unknown'),
+         'blocks_planting': bool(item.get('blocks_planting', True)), 'is_existing': True}
+        for item in parsed if isinstance(item, dict) and item.get('zone') in _VALID_ZONES
+    ]
+    return zones, None
 
 
 def scan_image_for_existing_elements(image_file):
@@ -123,27 +166,7 @@ def scan_image_for_existing_elements(image_file):
             mime_type=mime_type,
         )
 
-        system_prompt = (
-            "You are analyzing a garden or backyard photo to identify placement zones ONLY.\n\n"
-            "Divide the visible ground into these eight named zones:\n"
-            "  background_perimeter – far edge: fence line, house wall, back of garden\n"
-            "  midground_left       – mid-distance, left third of the space\n"
-            "  midground_center     – mid-distance, centre third\n"
-            "  midground_right      – mid-distance, right third\n"
-            "  foreground_left      – near viewer, left third\n"
-            "  foreground_center    – near viewer, centre third\n"
-            "  foreground_right     – near viewer, right third\n"
-            "  blocked              – any area already occupied and unplantable "
-            "(pool, patio, path, existing tree canopy, shed)\n\n"
-            "For each distinct feature you see, output exactly ONE JSON object:\n"
-            "  zone            – one of the eight zone names above\n"
-            "  label           – a short snake_case label (e.g. swimming_pool, house_wall)\n"
-            "  blocks_planting – true if this prevents new planting, false if visual backdrop only\n"
-            "  is_existing     – always true\n\n"
-            "CRITICAL: Return ONLY a raw JSON array. "
-            "No coordinates. No sizes. No explanations.\n"
-            'Example: [{"zone":"blocked","label":"patio","blocks_planting":true,"is_existing":true}]'
-        )
+        system_prompt = ZONE_SCAN_PROMPT
 
         response = client.models.generate_content(
             model='gemini-2.5-flash',
@@ -195,3 +218,26 @@ def scan_image_for_existing_elements(image_file):
     except Exception:
         logger.exception("Failed during Vision AI zone scan.")
         return []
+
+
+ZONE_SCAN_PROMPT = (
+            "You are analyzing a garden or backyard photo to identify placement zones ONLY.\n\n"
+            "Divide the visible ground into these eight named zones:\n"
+            "  background_perimeter – far edge: fence line, house wall, back of garden\n"
+            "  midground_left       – mid-distance, left third of the space\n"
+            "  midground_center     – mid-distance, centre third\n"
+            "  midground_right      – mid-distance, right third\n"
+            "  foreground_left      – near viewer, left third\n"
+            "  foreground_center    – near viewer, centre third\n"
+            "  foreground_right     – near viewer, right third\n"
+            "  blocked              – any area already occupied and unplantable "
+            "(pool, patio, path, existing tree canopy, shed)\n\n"
+            "For each distinct feature you see, output exactly ONE JSON object:\n"
+            "  zone            – one of the eight zone names above\n"
+            "  label           – a short snake_case label (e.g. swimming_pool, house_wall)\n"
+            "  blocks_planting – true if this prevents new planting, false if visual backdrop only\n"
+            "  is_existing     – always true\n\n"
+            "CRITICAL: Return ONLY a raw JSON array. "
+            "No coordinates. No sizes. No explanations.\n"
+            'Example: [{"zone":"blocked","label":"patio","blocks_planting":true,"is_existing":true}]'
+        )
