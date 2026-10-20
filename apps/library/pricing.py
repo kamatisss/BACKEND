@@ -25,7 +25,7 @@ from .models import InventoryItem, PricingSettings
 RATE_FIELDS = [
     'planting_tall', 'planting_mid', 'planting_low', 'install_other', 'site_prep_per_sqm', 'materials_per_sqm',
     'mobilization_fee', 'design_fee_percent', 'minimum_project', 'estimate_range_percent', 'vat_percent',
-    'shipping_fee',
+    'shipping_fee', 'cod_max_amount',
 ]
 PERCENT_FIELDS = {'design_fee_percent', 'estimate_range_percent', 'vat_percent'}
 

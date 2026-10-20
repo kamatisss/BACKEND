@@ -235,6 +235,11 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'remaining_balance': float(t.remaining_balance),
             'amount_paid': float(t.total_price - t.remaining_balance),
             'estimated_end_date': t.estimated_end_date,
+            # Open payment requests the customer can pay online at /pay/<token>
+            'pending_payments': [
+                {'id': r.id, 'label': r.label, 'amount': float(r.amount), 'token': r.token}
+                for r in t.payment_requests.all() if r.status == 'PENDING'
+            ],
         }
 
     def validate(self, attrs):

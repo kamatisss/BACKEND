@@ -991,6 +991,7 @@ class CheckoutSecurityTests(APITestCase):
     def _order(self, items, **extra):
         return self.client.post('/api/checkout/', {
             'customer_name': 'Buyer', 'customer_email': 'b@example.com', 'customer_address': 'Lucena',
+            'customer_phone': '09171234567',
             'payment_method': 'cod', 'items': items, **extra}, format='json')
 
     def test_client_total_is_ignored(self):
@@ -1019,6 +1020,39 @@ class CheckoutSecurityTests(APITestCase):
         ps.save()
         self.assertEqual(self._order([{'id': self.plant.id, 'quantity': 1}]).data['total_price'], 750.0)
 
+    def test_phone_must_be_a_ph_mobile_and_is_normalised(self):
+        from apps.library.models import Order
+        for bad in ('', '09856857', '0917123456789', '0217123456', 'call me'):
+            r = self._order([{'id': self.plant.id, 'quantity': 1}], customer_phone=bad)
+            self.assertEqual(r.status_code, 400, bad)
+            self.assertIn('mobile number', r.data['error'])
+        for good in ('0917 123 4567', '+63 917-123-4567', '639171234567', '9171234567'):
+            r = self._order([{'id': self.plant.id, 'quantity': 1}], customer_phone=good)
+            self.assertEqual(r.status_code, 201, good)
+            self.assertEqual(Order.objects.get(pk=r.data['order_id']).customer_phone, '09171234567')
+
+    def test_cod_has_a_cap_from_the_rate_card(self):
+        from apps.library.models import PricingSettings
+        ps = PricingSettings.current()
+        ps.cod_max_amount = 1000
+        ps.save()
+        r = self._order([{'id': self.plant.id, 'quantity': 2}])  # ₱1,150 > ₱1,000
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('up to ₱1,000', r.data['error'])
+        self.plant.refresh_from_db()
+        self.assertEqual(self.plant.stock_quantity, 10)  # rolled back
+        self.assertEqual(self._order([{'id': self.plant.id, 'quantity': 2}], payment_method='online').status_code, 201)
+        ps.cod_max_amount = 0  # 0 = no limit
+        ps.save()
+        self.assertEqual(self._order([{'id': self.plant.id, 'quantity': 2}]).status_code, 201)
+
+    def test_guests_cannot_use_cod(self):
+        self.client.credentials()
+        r = self._order([{'id': self.plant.id, 'quantity': 1}])
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('log in', r.data['error'])
+        self.assertEqual(self._order([{'id': self.plant.id, 'quantity': 1}], payment_method='online').status_code, 201)
+
     def test_only_the_owner_can_pay_and_never_twice(self):
         from apps.library.models import Order
         order_id = self._order([{'id': self.plant.id, 'quantity': 1}]).data['order_id']
@@ -1029,6 +1063,251 @@ class CheckoutSecurityTests(APITestCase):
         r = self.client.post('/api/create-checkout-session/', {'order_id': order_id}, format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('already Paid', r.data['error'])
+
+
+@override_settings(PAYMONGO_SECRET_KEY='sk_test_x', PAYMONGO_WEBHOOK_SECRET='whsk_test',
+                   PAYMONGO_ORDER_TTL_MINUTES=60, FRONTEND_URL='http://front')
+class PayMongoTests(APITestCase):
+    """GCash/Maya/card checkout through PayMongo; all HTTP calls are mocked."""
+
+    def setUp(self):
+        from apps.library.models import InventoryItem
+        self.user = User.objects.create_user(username='buyer', password='pw')
+        self.plant = InventoryItem.objects.create(name='Fern', category='plant', unit_price=500, stock_quantity=10)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.user).access_token}')
+
+    def _order(self, method='online', qty=2):
+        r = self.client.post('/api/checkout/', {
+            'customer_name': 'Buyer', 'customer_email': 'b@example.com', 'customer_address': 'Lucena',
+            'customer_phone': '09171234567',
+            'payment_method': method, 'items': [{'id': self.plant.id, 'quantity': qty}]}, format='json')
+        self.assertEqual(r.status_code, 201, r.data)
+        return r.data
+
+    @staticmethod
+    def _session(status='active', paid_amount=None):
+        payments = [{'id': 'pay_1', 'attributes': {'status': 'paid', 'amount': paid_amount}}] if paid_amount else []
+        return {'id': 'cs_1', 'attributes': {'status': status, 'checkout_url': 'https://pm.test/cs_1',
+                                             'payments': payments, 'metadata': {}}}
+
+    def _webhook(self, body, secret='whsk_test'):
+        import hashlib, hmac
+        raw = json.dumps(body).encode()
+        sig = hmac.new(secret.encode(), b'123.' + raw, hashlib.sha256).hexdigest()
+        return self.client.generic('POST', '/api/paymongo-webhook/', raw, content_type='application/json',
+                                   HTTP_PAYMONGO_SIGNATURE=f't=123,te={sig},li=')
+
+    def test_checkout_session_is_itemised_and_reused(self):
+        from apps.library.models import Order
+        data = self._order()
+        with patch('apps.library.paymongo._request', return_value=self._session()) as req:
+            r = self.client.post('/api/create-checkout-session/', {'order_id': data['order_id']}, format='json')
+        self.assertEqual(r.data['checkout_url'], 'https://pm.test/cs_1')
+        attrs = req.call_args.args[2]['data']['attributes']
+        self.assertEqual(sum(li['amount'] * li['quantity'] for li in attrs['line_items']), 115000)  # ₱1,150.00
+        self.assertIn('gcash', attrs['payment_method_types'])
+        self.assertIn('qrph', attrs['payment_method_types'])
+        self.assertIn(f"token={data['receipt_token']}", attrs['success_url'])
+        self.assertEqual(Order.objects.get(pk=data['order_id']).paymongo_checkout_id, 'cs_1')
+        # "Pay now" again: the open session is reused, no new one is created
+        with patch('apps.library.paymongo._request', return_value=self._session()) as req:
+            self.client.post('/api/create-checkout-session/', {'order_id': data['order_id']}, format='json')
+        self.assertEqual([c.args[0] for c in req.call_args_list], ['GET', 'GET'])
+
+    def test_signed_webhook_marks_order_paid(self):
+        from apps.library.models import Order
+        data = self._order()
+        Order.objects.filter(pk=data['order_id']).update(paymongo_checkout_id='cs_1')
+        event = {'data': {'attributes': {'type': 'checkout_session.payment.paid',
+                                         'data': self._session(paid_amount=115000)}}}
+        self.assertEqual(self._webhook(event, secret='wrong').status_code, 400)
+        self.assertEqual(Order.objects.get(pk=data['order_id']).payment_status, 'Pending')
+        self.assertEqual(self._webhook(event).status_code, 200)
+        order = Order.objects.get(pk=data['order_id'])
+        self.assertEqual((order.payment_status, order.status, order.paymongo_payment_id), ('Paid', 'Paid', 'pay_1'))
+
+    def test_short_payment_is_not_accepted(self):
+        from apps.library.models import Order
+        data = self._order()
+        Order.objects.filter(pk=data['order_id']).update(paymongo_checkout_id='cs_1')
+        event = {'data': {'attributes': {'type': 'checkout_session.payment.paid',
+                                         'data': self._session(paid_amount=100)}}}
+        self._webhook(event)
+        self.assertEqual(Order.objects.get(pk=data['order_id']).payment_status, 'Pending')
+
+    def test_receipt_needs_token_or_owner_and_syncs_payment(self):
+        from apps.library.models import Order
+        data = self._order()
+        Order.objects.filter(pk=data['order_id']).update(paymongo_checkout_id='cs_1')
+        url = f"/api/order-receipt/{data['order_id']}/"
+        self.client.credentials()
+        self.assertEqual(self.client.get(url).status_code, 404)
+        self.assertEqual(self.client.get(url, {'token': 'guess'}).status_code, 404)
+        with patch('apps.library.paymongo._request', return_value=self._session(paid_amount=115000)):
+            r = self.client.get(url, {'token': data['receipt_token']})
+        self.assertEqual(r.data['payment_status'], 'Paid')  # no webhook needed on localhost
+
+    def test_abandoned_online_order_expires_and_returns_stock(self):
+        from apps.library.models import Order
+        from django.utils import timezone
+        data = self._order(qty=3)
+        cod = self._order(method='cod', qty=1)
+        Order.objects.update(created_at=timezone.now() - timedelta(hours=2))
+        self.plant.refresh_from_db()
+        self.assertEqual(self.plant.stock_quantity, 6)
+        self.client.get('/api/orders/')
+        order = Order.objects.get(pk=data['order_id'])
+        self.assertEqual((order.status, order.payment_status), ('Cancelled', 'Expired'))
+        self.assertEqual(Order.objects.get(pk=cod['order_id']).status, 'Pending')  # COD is never expired
+        self.plant.refresh_from_db()
+        self.assertEqual(self.plant.stock_quantity, 9)
+
+    def test_customer_cancel_returns_stock_but_paid_orders_stay(self):
+        from apps.library.models import Order
+        first, second = self._order(qty=2), self._order(qty=2)
+        self.assertEqual(self.client.delete(f"/api/orders/{first['order_id']}/").status_code, 204)
+        self.plant.refresh_from_db()
+        self.assertEqual(self.plant.stock_quantity, 8)
+        Order.objects.filter(pk=second['order_id']).update(payment_status='Paid')
+        self.assertEqual(self.client.delete(f"/api/orders/{second['order_id']}/").status_code, 400)
+
+
+@override_settings(PAYMONGO_SECRET_KEY='sk_test_x', PAYMONGO_WEBHOOK_SECRET='whsk_test', FRONTEND_URL='http://front')
+class ProjectPaymentRequestTests(APITestCase):
+    """Staff request a downpayment; the customer pays through the /pay/<token> link (PayMongo mocked)."""
+
+    def setUp(self):
+        from apps.library.models import StaffProfile, ServiceBooking, ProjectTracker
+        self.admin = User.objects.create_user(username='office', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.admin, role='OFFICE_ADMIN')
+        self.crew = User.objects.create_user(username='crew', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
+        self.customer = User.objects.create_user(username='cust', password='pw', first_name='Ana',
+                                                 email='ana@example.com')
+        booking = ServiceBooking.objects.create(user=self.customer, service_type='Softscape',
+                                                scheduled_date='2026-11-01')
+        self.tracker = ProjectTracker.objects.create(booking=booking, total_price=40000, remaining_balance=40000)
+        self.url = f'/api/projects/{self.tracker.id}/payment-requests/'
+
+    def _as(self, user):
+        if user is None:
+            self.client.credentials()
+        else:
+            self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+
+    def _request(self, amount=20000, label='Downpayment (50%)'):
+        self._as(self.admin)
+        r = self.client.post(self.url, {'amount': amount, 'label': label}, format='json')
+        self.assertEqual(r.status_code, 201, r.data)
+        return r.data
+
+    @staticmethod
+    def _session(paid_amount=None):
+        payments = [{'id': 'pay_9', 'attributes': {'status': 'paid', 'amount': paid_amount}}] if paid_amount else []
+        return {'id': 'cs_9', 'attributes': {'status': 'active', 'checkout_url': 'https://pm.test/cs_9',
+                                             'payments': payments, 'metadata': {}}}
+
+    def test_only_office_admins_create_requests_within_the_balance(self):
+        from apps.library.models import Notification
+        self._as(self.crew)
+        self.assertEqual(self.client.post(self.url, {'amount': 1000}, format='json').status_code, 403)
+        self._as(self.customer)
+        self.assertEqual(self.client.post(self.url, {'amount': 1000}, format='json').status_code, 403)
+        data = self._request(30000)
+        self.assertTrue(data['pay_url'].startswith('http://front/pay/'))
+        self.assertTrue(Notification.objects.filter(user=self.customer, message__contains=data['pay_url']).exists())
+        # The open ₱30,000 request counts against the ₱40,000 balance
+        self._as(self.admin)
+        r = self.client.post(self.url, {'amount': 15000}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('₱10,000.00', r.data['error'])
+        self._as(self.customer)  # the customer can see their own requests
+        self.assertEqual(len(self.client.get(self.url).data), 1)
+
+    def test_pay_link_checkout_and_sync_lowers_the_balance_once(self):
+        token = self._request()['pay_url'].rsplit('/', 1)[1]
+        self._as(None)  # the link works without logging in
+        self.assertEqual(self.client.get('/api/project-payments/wrong-token/').status_code, 404)
+        detail = self.client.get(f'/api/project-payments/{token}/').data
+        self.assertEqual((detail['amount'], detail['status'], detail['customer_first_name']), (20000.0, 'PENDING', 'Ana'))
+        self.assertNotIn('ana@example.com', str(detail))
+
+        with patch('apps.library.paymongo._request', return_value=self._session()) as req:
+            r = self.client.post(f'/api/project-payments/{token}/checkout/')
+        self.assertEqual(r.data['checkout_url'], 'https://pm.test/cs_9')
+        attrs = req.call_args.args[2]['data']['attributes']
+        self.assertEqual(attrs['line_items'][0]['amount'], 2000000)
+        self.assertEqual(attrs['metadata']['project_payment_request_id'], str(self.tracker.payment_requests.get().id))
+
+        with patch('apps.library.paymongo._request', return_value=self._session(paid_amount=2000000)):
+            self.assertEqual(self.client.get(f'/api/project-payments/{token}/').data['status'], 'PAID')
+            self.client.get(f'/api/project-payments/{token}/')  # second sync must not pay twice
+            self.assertEqual(self.client.post(f'/api/project-payments/{token}/checkout/').status_code, 400)
+        self.tracker.refresh_from_db()
+        self.assertEqual(self.tracker.remaining_balance, 20000)
+        self.assertEqual(self.tracker.history_logs.filter(remarks__startswith='Payment received online').count(), 1)
+
+    def test_webhook_marks_request_paid(self):
+        import hashlib, hmac
+        self._request(10000)
+        req = self.tracker.payment_requests.get()
+        req.paymongo_checkout_id = 'cs_9'
+        req.save()
+        raw = json.dumps({'data': {'attributes': {'type': 'checkout_session.payment.paid',
+                                                  'data': self._session(paid_amount=1000000)}}}).encode()
+        sig = hmac.new(b'whsk_test', b'1.' + raw, hashlib.sha256).hexdigest()
+        r = self.client.generic('POST', '/api/paymongo-webhook/', raw, content_type='application/json',
+                                HTTP_PAYMONGO_SIGNATURE=f't=1,te={sig},li=')
+        self.assertEqual(r.status_code, 200)
+        req.refresh_from_db()
+        self.tracker.refresh_from_db()
+        self.assertEqual((req.status, req.paymongo_payment_id), ('PAID', 'pay_9'))
+        self.assertEqual(self.tracker.remaining_balance, 30000)
+
+    def test_cancelled_request_cannot_be_paid_and_frees_the_balance(self):
+        data = self._request(40000)
+        token = data['pay_url'].rsplit('/', 1)[1]
+        cancel = f"{self.url}{data['id']}/cancel/"
+        self._as(self.crew)
+        self.assertEqual(self.client.post(cancel).status_code, 403)
+        self._as(self.admin)
+        self.assertEqual(self.client.post(cancel).data['status'], 'CANCELLED')
+        self.assertEqual(self.client.post(cancel).status_code, 400)
+        self._as(None)
+        self.assertEqual(self.client.post(f'/api/project-payments/{token}/checkout/').status_code, 400)
+        self._request(40000)  # the full balance can be requested again
+
+    def test_new_request_is_emailed_and_can_be_resent(self):
+        from django.core import mail
+        data = self._request(20000)
+        self.assertTrue(data['email_sent'])
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox[0]
+        self.assertEqual(email.to, ['ana@example.com'])
+        self.assertIn('₱20,000.00', email.subject)
+        self.assertIn(data['pay_url'], email.body)
+        self.assertIn(data['pay_url'], email.alternatives[0][0])  # HTML version with the Pay button
+
+        resend = f"{self.url}{data['id']}/send-email/"
+        self._as(self.crew)
+        self.assertEqual(self.client.post(resend).status_code, 403)
+        self._as(self.admin)
+        self.assertEqual(self.client.post(resend).status_code, 200)
+        self.assertEqual(len(mail.outbox), 2)
+
+    def test_email_problems_never_block_the_request(self):
+        from django.core import mail
+        with patch('django.core.mail.EmailMultiAlternatives.send', side_effect=OSError('SMTP down')):
+            data = self._request(10000)
+        self.assertFalse(data['email_sent'])
+        self.assertIn('Copy the link', data['email_message'])
+        self.customer.email = ''
+        self.customer.save()
+        data = self._request(10000)
+        self.assertFalse(data['email_sent'])
+        self.assertIn('no email', data['email_message'])
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual(self.tracker.payment_requests.count(), 2)
 
 
 class PricingTests(APITestCase):

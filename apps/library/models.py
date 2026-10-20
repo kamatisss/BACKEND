@@ -246,8 +246,14 @@ class Order(models.Model):
         ('Cancelled', 'Cancelled'),
     ]
     PAYMENT_METHOD_CHOICES = [
-        ('stripe', 'Online Payment (Stripe)'),
+        ('online', 'Online Payment (QR Ph / GCash / Maya / Card)'),
         ('cod',    'Cash on Delivery'),
+    ]
+    PAYMENT_STATUS_CHOICES = [
+        ('Pending',  'Pending'),
+        ('Paid',     'Paid'),
+        ('Expired',  'Expired'),   # online order not paid in time; stock returned
+        ('Refunded', 'Refunded'),
     ]
     user             = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
     customer_name    = models.CharField(max_length=150)
@@ -256,9 +262,15 @@ class Order(models.Model):
     customer_address = models.TextField()
     booking_date     = models.DateField(null=True, blank=True)
     total_price      = models.DecimalField(max_digits=12, decimal_places=2)
-    payment_method   = models.CharField(max_length=10, choices=PAYMENT_METHOD_CHOICES, default='stripe')
+    payment_method   = models.CharField(max_length=10, choices=PAYMENT_METHOD_CHOICES, default='online')
     status           = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Pending')
-    payment_status   = models.CharField(max_length=20, default='Pending')
+    payment_status   = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='Pending')
+    # PayMongo checkout session (cs_...) and payment (pay_...) for online orders
+    paymongo_checkout_id = models.CharField(max_length=64, blank=True, default='', db_index=True)
+    paymongo_payment_id  = models.CharField(max_length=64, blank=True, default='')
+    paid_at          = models.DateTimeField(null=True, blank=True)
+    # Lets a guest open their own receipt page without logging in
+    receipt_token    = models.CharField(max_length=43, blank=True, default='')
     created_at       = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -380,6 +392,35 @@ class ProjectTracker(models.Model):
             f"Tracker#{self.pk} — Booking#{self.booking_id} "
             f"[{self.status} {self.progress_percentage}%]"
         )
+
+
+class ProjectPaymentRequest(models.Model):
+    """
+    Staff ask the customer for part of a project's price (e.g. a 50% downpayment).
+    The customer pays through a link to our /pay/<token> page, which opens a fresh
+    PayMongo checkout each time, so the link itself never expires.
+    """
+    STATUS_CHOICES = [
+        ('PENDING',   'Pending'),
+        ('PAID',      'Paid'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+    project = models.ForeignKey(ProjectTracker, on_delete=models.CASCADE, related_name='payment_requests')
+    label = models.CharField(max_length=120, default='Downpayment')
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='PENDING')
+    token = models.CharField(max_length=43, unique=True)
+    paymongo_checkout_id = models.CharField(max_length=64, blank=True, default='', db_index=True)
+    paymongo_payment_id = models.CharField(max_length=64, blank=True, default='')
+    paid_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.label} ₱{self.amount} for project #{self.project_id} [{self.status}]"
 
 
 class ProjectHistoryLog(models.Model):
@@ -612,6 +653,8 @@ class PricingSettings(models.Model):
     # Shop
     shipping_fee = models.DecimalField(max_digits=10, decimal_places=2, default=150,
                                        help_text='Flat delivery fee per shop order')
+    cod_max_amount = models.DecimalField(max_digits=12, decimal_places=2, default=5000,
+                                         help_text='Largest order total allowed as Cash on Delivery (0 = no limit)')
 
     is_sample = models.BooleanField(default=True, help_text='True until an admin saves real rates')
     updated_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')

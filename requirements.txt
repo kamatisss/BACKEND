@@ -48,7 +48,6 @@ setuptools
 shellingham
 six
 sqlparse
-stripe
 sympy
 timm
 torch

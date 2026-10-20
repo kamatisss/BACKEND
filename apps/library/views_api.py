@@ -1,9 +1,9 @@
-import stripe
 import os
+import re
+import secrets
 import json
 import logging
 import time
-from urllib.parse import quote
 import math
 from rest_framework.views import APIView
 from rest_framework.throttling import UserRateThrottle
@@ -56,7 +56,7 @@ def bind_proof_to_milestone(booking_id: int, phase: str, photo_url: str) -> None
 from django.http import HttpResponse
 
 from rest_framework import viewsets, status, generics
-from rest_framework.decorators import action, api_view
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser, BasePermission
 from rest_framework.response import Response
 
@@ -113,12 +113,15 @@ from django.shortcuts import get_object_or_404
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .portfolio import create_portfolio_draft, sanitize_image
+from . import paymongo
+from .emails import send_payment_request_email
 
 from .models import (
     InventoryItem, GardenDesign, BlackoutDate, ServiceBooking,
     Order, OrderItem, Attendance, ProjectMilestone, StaffAttendance,
     StaffProfile, Notification, ServiceReview, ProductReview,
     ProjectTracker, ProjectHistoryLog, ProjectProgressMedia, PricingSettings,
+    ProjectPaymentRequest,
 )
 from .serializers import (
     InventoryItemSerializer,
@@ -304,7 +307,7 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        base = ServiceBooking.objects.select_related('design', 'design__garden_image', 'tracker').prefetch_related('assigned_crew')
+        base = ServiceBooking.objects.select_related('design', 'design__garden_image', 'tracker').prefetch_related('assigned_crew', 'tracker__payment_requests')
 
         if not (user.is_staff or user.is_superuser):
             return base.filter(user=user)
@@ -1286,9 +1289,23 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         # Standard users can only see their own orders
         return qs.filter(user=self.request.user)
 
+    def list(self, request, *args, **kwargs):
+        paymongo.expire_unpaid_online_orders()
+        return super().list(request, *args, **kwargs)
+
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
-        instance.delete()
+        is_staff = request.user.is_staff or request.user.is_superuser
+        if not is_staff and (instance.status != 'Pending' or instance.payment_status == 'Paid'):
+            # A paid order needs a refund from staff, not a silent delete
+            return Response({'error': 'This order can no longer be cancelled here. Please contact us.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            if instance.status not in ('Cancelled', 'Delivered'):
+                paymongo.release_stock(instance)
+            instance.delete()
+        if instance.paymongo_checkout_id:
+            paymongo.expire_checkout_session(instance.paymongo_checkout_id)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['patch'], permission_classes=[IsAuthenticated])
@@ -1299,6 +1316,8 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 
         if not (request.user.is_staff or request.user.is_superuser):
             return Response({'error': 'Unauthorized'}, status=status.HTTP_403_FORBIDDEN)
+        if new_payment_status and new_payment_status not in dict(Order.PAYMENT_STATUS_CHOICES):
+            return Response({'error': f'Invalid payment status: {new_payment_status}'}, status=status.HTTP_400_BAD_REQUEST)
 
         if new_status:
             # Map common variants like 'shipped', 'out_for_delivery', 'delivered', 'cancelled' to capitalized choices
@@ -1313,6 +1332,8 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
                 normalized_status = 'Cancelled'
 
             if normalized_status in dict(Order.STATUS_CHOICES):
+                if normalized_status == 'Cancelled' and order.status not in ('Cancelled', 'Delivered'):
+                    paymongo.release_stock(order)
                 order.status = normalized_status
                 if normalized_status == 'Delivered' and order.payment_method == 'cod':
                     order.payment_status = 'Paid'
@@ -1326,6 +1347,13 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
 
+def normalize_ph_mobile(raw):
+    """'0917 123 4567', '+63 917-123-4567', '639171234567' -> '09171234567'; None if not a PH mobile."""
+    digits = re.sub(r'[\s\-().]', '', str(raw or ''))
+    match = re.fullmatch(r'(?:\+?63|0)?(9\d{9})', digits)
+    return f'0{match.group(1)}' if match else None
+
+
 @api_view(['POST'])
 def checkout(request):
     data = request.data
@@ -1333,7 +1361,7 @@ def checkout(request):
     customer_email = data.get('customer_email')
     customer_phone = data.get('customer_phone', '')
     customer_address = data.get('customer_address')
-    payment_method = data.get('payment_method', 'stripe')
+    payment_method = data.get('payment_method', 'online')
     items_data = data.get('items', [])
     # Any client-sent total_price is ignored: the server prices the order from the catalog.
     # (Trusting it let a modified request pay ₱1 for any order.)
@@ -1353,7 +1381,20 @@ def checkout(request):
             return Response({'error': 'Quantities must be between 1 and 999.'}, status=status.HTTP_400_BAD_REQUEST)
         quantities[item_id] = quantities.get(item_id, 0) + quantity
 
-    shipping_fee = PricingSettings.current().shipping_fee
+    if not customer_name or not customer_email or not customer_address:
+        return Response({'error': 'Name, email and delivery address are required.'}, status=status.HTTP_400_BAD_REQUEST)
+    # The rider calls this number on delivery
+    customer_phone = normalize_ph_mobile(customer_phone)
+    if not customer_phone:
+        return Response({'error': 'Enter a valid PH mobile number, e.g. 09171234567.'}, status=status.HTTP_400_BAD_REQUEST)
+    if payment_method == 'cod' and not request.user.is_authenticated:
+        return Response({'error': 'Please log in to use Cash on Delivery, or pay online.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Return stock held by abandoned online payments before checking availability
+    paymongo.expire_unpaid_online_orders()
+
+    pricing = PricingSettings.current()
+    shipping_fee = pricing.shipping_fee
     try:
         with transaction.atomic():
             order = Order.objects.create(
@@ -1363,6 +1404,7 @@ def checkout(request):
                 customer_phone=customer_phone,
                 customer_address=customer_address,
                 payment_method=payment_method,
+                receipt_token=secrets.token_urlsafe(32),
                 total_price=0,
             )
 
@@ -1389,9 +1431,14 @@ def checkout(request):
                 subtotal += inventory_item.unit_price * quantity
 
             order.total_price = subtotal + shipping_fee
+            if payment_method == 'cod' and pricing.cod_max_amount and order.total_price > pricing.cod_max_amount:
+                # Raising rolls back the order and the stock it took
+                raise ValueError(f'Cash on Delivery is available for orders up to ₱{pricing.cod_max_amount:,.0f}. '
+                                 'Please pay online with QR Ph, GCash, Maya or card.')
             order.save(update_fields=['total_price'])
 
         return Response({'message': 'Order successfully placed!', 'order_id': order.id,
+                         'receipt_token': order.receipt_token,
                          'subtotal': float(subtotal), 'shipping_fee': float(shipping_fee),
                          'total_price': float(order.total_price)},
                         status=status.HTTP_201_CREATED)
@@ -1403,17 +1450,23 @@ def checkout(request):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stripe Payment Endpoints
+# PayMongo Payment Endpoints (QR Ph / GCash / Maya / Card)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _can_view_order(request, order, token=''):
+    """Owner, staff, or anyone holding the order's receipt token (guest checkouts)."""
+    user = request.user
+    if user.is_authenticated and (user.is_staff or user.is_superuser or order.user_id == user.id):
+        return True
+    return bool(token and order.receipt_token and secrets.compare_digest(token, order.receipt_token))
+
 
 @api_view(['POST'])
 def create_checkout_session(request):
     """
-    Accept an order_id, look up the Order, and create a Stripe Checkout Session.
-    Returns the checkout_url for the React frontend to redirect to.
+    Accept an order_id and return a PayMongo hosted checkout_url for it.
+    Also used by "Pay now" on My Orders: an open session is reused instead of making a new one.
     """
-    stripe.api_key = settings.STRIPE_SECRET_KEY
-
     order_id = request.data.get('order_id')
     if not order_id:
         return Response({'error': 'order_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1425,79 +1478,158 @@ def create_checkout_session(request):
     # Only the customer who placed an order can pay for it (guest orders have no owner)
     if order.user_id and order.user_id != getattr(request.user, 'id', None):
         return Response({'error': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    order = paymongo.sync_order_payment(order)
     if order.payment_status == 'Paid' or order.status == 'Cancelled':
         return Response({'error': f'Order #{order.id} is already {order.payment_status if order.payment_status == "Paid" else "cancelled"}.'},
                         status=status.HTTP_400_BAD_REQUEST)
-
-    # Convert total_price from Philippine Peso to centavos (Stripe uses smallest currency unit)
-    amount_centavos = int(order.total_price * 100)
-
-    frontend_url = settings.FRONTEND_URL  # e.g. 'http://localhost:5173'
-    success_url  = (
-        f"{frontend_url}/order-success"
-        f"?order_id={order.id}"
-        f"&total={order.total_price}"
-        f"&name={quote(order.customer_name or '')}"
-    )
-    cancel_url = f"{frontend_url}/studio"
+    if order.payment_method != 'online':
+        return Response({'error': 'This order is Cash on Delivery.'}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{
-                'price_data': {
-                    'currency': 'php',
-                    'product_data': {
-                        'name': f'Garden Studio Order #{order.id}',
-                        'description': f'Landscaping items for {order.customer_name}',
-                    },
-                    'unit_amount': amount_centavos,
-                },
-                'quantity': 1,
-            }],
-            mode='payment',
-            client_reference_id=str(order.id),  # Used by webhook to find the order
-            customer_email=order.customer_email,
-            success_url=success_url,
-            cancel_url=cancel_url,
-        )
-        return Response({'checkout_url': session.url})
-    except stripe.error.StripeError as e:
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if order.paymongo_checkout_id:
+            session = paymongo.retrieve_checkout_session(order.paymongo_checkout_id)
+            if session['attributes'].get('status') == 'active':
+                return Response({'checkout_url': session['attributes']['checkout_url']})
+
+        receipt = f"{settings.FRONTEND_URL}/order-success?order_id={order.id}&token={order.receipt_token}"
+        session_id, checkout_url = paymongo.create_checkout_session(
+            order, success_url=receipt, cancel_url=f"{receipt}&cancelled=1")
+    except paymongo.PayMongoError as e:
+        return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    order.paymongo_checkout_id = session_id
+    order.save(update_fields=['paymongo_checkout_id'])
+    return Response({'checkout_url': checkout_url})
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def order_receipt(request, pk):
+    """
+    GET /api/order-receipt/<id>/?token=...
+    The order-success page reads the real payment state from here, never from its URL.
+    Unpaid online orders are checked against PayMongo, so this works without webhooks (localhost).
+    """
+    order = Order.objects.filter(pk=pk).first()
+    if not order or not _can_view_order(request, order, request.query_params.get('token', '')):
+        return Response({'error': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+    order = paymongo.sync_order_payment(order)
+    return Response({
+        'id': order.id,
+        'customer_name': order.customer_name,
+        'total_price': float(order.total_price),
+        'payment_method': order.payment_method,
+        'payment_status': order.payment_status,
+        'status': order.status,
+        'created_at': order.created_at,
+        'paid_at': order.paid_at,
+        'items': [{'name': oi.item.name if oi.item else 'Deleted item', 'quantity': oi.quantity}
+                  for oi in order.items.select_related('item')],
+    })
 
 
 @csrf_exempt
-def stripe_webhook(request):
+def paymongo_webhook(request):
     """
-    Stripe sends a signed POST here when payment events occur.
-    We listen for checkout.session.completed and mark the Order as Paid.
+    PayMongo sends a signed POST here when a checkout session is paid.
+    Register https://<domain>/api/paymongo-webhook/ for event checkout_session.payment.paid.
     """
-    stripe.api_key      = settings.STRIPE_SECRET_KEY
-    webhook_secret      = settings.STRIPE_WEBHOOK_SECRET
-    payload             = request.body
-    sig_header          = request.META.get('HTTP_STRIPE_SIGNATURE', '')
-
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    if not paymongo.verify_webhook_signature(request.body, request.META.get('HTTP_PAYMONGO_SIGNATURE', '')):
+        return HttpResponse(status=400)
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
-    except ValueError:
-        # Invalid payload
-        return HttpResponse(status=400)
-    except stripe.error.SignatureVerificationError:
-        # Invalid signature
+        event = json.loads(request.body)['data']['attributes']
+    except (ValueError, KeyError, TypeError):
         return HttpResponse(status=400)
 
-    if event['type'] == 'checkout.session.completed':
-        session  = event['data']['object']
-        order_id = session.get('client_reference_id')
-        if order_id:
-            try:
-                order        = Order.objects.get(id=order_id)
-                order.status = 'Paid'
-                order.save()
-            except Order.DoesNotExist:
-                pass  # Order deleted mid-session — ignore gracefully
+    if event.get('type') == 'checkout_session.payment.paid':
+        session = event.get('data') or {}
+        metadata = session.get('attributes', {}).get('metadata') or {}
+        payment = paymongo.paid_payment(session)
 
+        def by_session_or_metadata(model, key):
+            obj_id = metadata.get(key)
+            return (model.objects.filter(paymongo_checkout_id=session.get('id')).first()
+                    or (model.objects.filter(pk=obj_id).first() if str(obj_id or '').isdigit() else None))
+
+        order = by_session_or_metadata(Order, 'order_id')
+        req = None if order else by_session_or_metadata(ProjectPaymentRequest, 'project_payment_request_id')
+        if payment and order:
+            paymongo.mark_order_paid(order, payment)
+        elif payment and req:
+            paymongo.mark_project_request_paid(req, payment)
+        else:
+            logger.warning('PayMongo webhook: no order/payment request/payment for session %s', session.get('id'))
+
+    # Always 200 for verified events so PayMongo stops retrying
     return HttpResponse(status=200)
+
+
+def payment_request_data(req):
+    return {
+        'id': req.id,
+        'label': req.label,
+        'amount': float(req.amount),
+        'status': req.status,
+        'status_display': req.get_status_display(),
+        'created_at': req.created_at,
+        'paid_at': req.paid_at,
+        'pay_url': f"{settings.FRONTEND_URL}/pay/{req.token}",
+    }
+
+
+def _payment_request_by_token(token):
+    return (ProjectPaymentRequest.objects.select_related('project__booking__user')
+            .filter(token=token).first())
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def project_payment_detail(request, token):
+    """
+    GET /api/project-payments/<token>/
+    What the /pay/<token> page shows. Anyone with the link can see and pay it
+    (staff send it over Messenger/SMS; a family member may pay), so only show what the payer needs.
+    """
+    req = _payment_request_by_token(token)
+    if not req:
+        return Response({'error': 'This payment link is not valid.'}, status=status.HTTP_404_NOT_FOUND)
+    req = paymongo.sync_project_request_payment(req)
+    booking = req.project.booking
+    return Response({
+        **{k: v for k, v in payment_request_data(req).items() if k != 'pay_url'},
+        'customer_first_name': booking.user.first_name or booking.user.username,
+        'service': booking.get_service_type_display(),
+        'booking_id': booking.id,
+        'project_total': float(req.project.total_price),
+        'project_balance': float(req.project.remaining_balance),
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def project_payment_checkout(request, token):
+    """POST /api/project-payments/<token>/checkout/ -> {checkout_url} on PayMongo."""
+    req = _payment_request_by_token(token)
+    if not req:
+        return Response({'error': 'This payment link is not valid.'}, status=status.HTTP_404_NOT_FOUND)
+    req = paymongo.sync_project_request_payment(req)
+    if req.status != 'PENDING':
+        return Response({'error': f'This payment is already {req.get_status_display().lower()}.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    try:
+        url = paymongo.open_session_url(req.paymongo_checkout_id)
+        if not url:
+            page = f"{settings.FRONTEND_URL}/pay/{req.token}"
+            session_id, url = paymongo.create_project_payment_session(
+                req, success_url=f"{page}?done=1", cancel_url=page)
+            req.paymongo_checkout_id = session_id
+            req.save(update_fields=['paymongo_checkout_id'])
+    except paymongo.PayMongoError as e:
+        return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+    return Response({'checkout_url': url})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1968,7 +2100,8 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         # Write operations (create / edit / status advance) require admin/staff
-        if self.action in ('create', 'update', 'partial_update', 'destroy', 'update_status', 'record_payment'):
+        if self.action in ('create', 'update', 'partial_update', 'destroy', 'update_status', 'record_payment',
+                           'cancel_payment_request', 'email_payment_request'):
             return [IsAuthenticated(), IsOfficeAdmin()]
         return [IsAuthenticated()]
 
@@ -2080,6 +2213,80 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
                     + (f" — {note}" if note else ''),
         )
         return Response(ProjectTrackerSerializer(tracker, context={'request': request}).data)
+
+    # ── GET/POST /api/projects/<id>/payment-requests/ ────────────────────────
+    @action(detail=True, methods=['get', 'post'], url_path='payment-requests')
+    def payment_requests(self, request, pk=None):
+        """List a project's payment requests, or (office admin) ask the customer for a payment."""
+        from decimal import Decimal, InvalidOperation
+        tracker = self.get_object()
+        if request.method == 'GET':
+            return Response([payment_request_data(r) for r in tracker.payment_requests.all()])
+
+        if not IsOfficeAdmin().has_permission(request, self):
+            return Response({'error': 'Office admins only.'}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            amount = Decimal(str(request.data.get('amount'))).quantize(Decimal('0.01'))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({'error': 'amount must be a number.'}, status=status.HTTP_400_BAD_REQUEST)
+        if amount <= 0:
+            return Response({'error': 'amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+        # Open requests count against the balance, so the customer is never asked twice for the same money
+        pending = sum(r.amount for r in tracker.payment_requests.filter(status='PENDING'))
+        available = tracker.remaining_balance - pending
+        if amount > available:
+            return Response({'error': f'amount exceeds the ₱{available:,.2f} not yet paid or requested.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        label = (request.data.get('label') or 'Downpayment').strip()[:120]
+
+        req = ProjectPaymentRequest.objects.create(
+            project=tracker, label=label, amount=amount,
+            token=secrets.token_urlsafe(32), created_by=request.user,
+        )
+        ProjectHistoryLog.objects.create(
+            project=tracker, status_reached=tracker.status, trigger_user=request.user,
+            remarks=f"Payment requested: ₱{amount:,.2f} — {label}",
+        )
+        Notification.objects.create(
+            user=tracker.booking.user,
+            message=f"Payment request for your project: {label} ₱{amount:,.2f}. "
+                    f"Pay online with QR Ph, GCash, Maya or card: {settings.FRONTEND_URL}/pay/{req.token}",
+        )
+        sent, email_message = send_payment_request_email(req)
+        return Response({**payment_request_data(req), 'email_sent': sent, 'email_message': email_message},
+                        status=status.HTTP_201_CREATED)
+
+    # ── POST /api/projects/<id>/payment-requests/<req_id>/send-email/ ────────
+    @action(detail=True, methods=['post'], url_path=r'payment-requests/(?P<req_id>\d+)/send-email')
+    def email_payment_request(self, request, pk=None, req_id=None):
+        tracker = self.get_object()
+        req = get_object_or_404(tracker.payment_requests, pk=req_id)
+        if req.status != 'PENDING':
+            return Response({'error': f'This request is already {req.get_status_display().lower()}.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        sent, email_message = send_payment_request_email(req)
+        if not sent:
+            return Response({'error': email_message}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({**payment_request_data(req), 'email_sent': True, 'email_message': email_message})
+
+    # ── POST /api/projects/<id>/payment-requests/<req_id>/cancel/ ────────────
+    @action(detail=True, methods=['post'], url_path=r'payment-requests/(?P<req_id>\d+)/cancel')
+    def cancel_payment_request(self, request, pk=None, req_id=None):
+        tracker = self.get_object()
+        req = get_object_or_404(tracker.payment_requests, pk=req_id)
+        req = paymongo.sync_project_request_payment(req)  # don't cancel something already paid
+        if req.status != 'PENDING':
+            return Response({'error': f'This request is already {req.get_status_display().lower()}.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        req.status = 'CANCELLED'
+        req.save(update_fields=['status'])
+        if req.paymongo_checkout_id:
+            paymongo.expire_checkout_session(req.paymongo_checkout_id)
+        ProjectHistoryLog.objects.create(
+            project=tracker, status_reached=tracker.status, trigger_user=request.user,
+            remarks=f"Payment request cancelled: ₱{req.amount:,.2f} — {req.label}",
+        )
+        return Response(payment_request_data(req))
 
     # ── POST /api/projects/<id>/upload-media/ ────────────────────────────────
     @action(detail=True, methods=['post'], url_path='upload-media')

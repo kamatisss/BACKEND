@@ -278,7 +278,7 @@ class Command(BaseCommand):
                 picks = self.rng.sample(products, k=min(len(products), self.rng.choices([1, 2, 3, 4], [45, 30, 17, 8])[0]))
                 lines = [(p, self.rng.randint(1, max_qty.get(p.category, 3))) for p in picks]
                 total = sum((p.unit_price * q for p, q in lines), Decimal('0')) + SHIPPING_FEE
-                method = self.rng.choices(['cod', 'stripe'], [55, 45])[0]
+                method = self.rng.choices(['cod', 'online'], [55, 45])[0]
 
                 age = (self.today - day).days
                 if age > 10:
@@ -287,10 +287,10 @@ class Command(BaseCommand):
                     status = self.rng.choices(['Delivered', 'Out for Delivery', 'Shipped', 'Cancelled'], [50, 20, 25, 5])[0]
                 else:
                     status = self.rng.choices(['Pending', 'Shipped'], [75, 25])[0]
-                if status == 'Pending' and method == 'stripe':
+                if status == 'Pending' and method == 'online':
                     status = 'Paid'
 
-                paid = status != 'Cancelled' and (method == 'stripe' or status == 'Delivered')
+                paid = status != 'Cancelled' and (method == 'online' or status == 'Delivered')
                 planned.append((
                     Order(
                         user=customer, customer_name=f'{customer.first_name} {customer.last_name}',

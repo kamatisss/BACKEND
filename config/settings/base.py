@@ -149,12 +149,32 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 
-# ─── Stripe Configuration ─────────────────────────────────────────────────────
+# ─── PayMongo Configuration ───────────────────────────────────────────────────
 # Set these in your .env file (see .env.example). Never commit real keys.
-STRIPE_SECRET_KEY     = os.environ.get('STRIPE_SECRET_KEY', '')
-STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+PAYMONGO_SECRET_KEY     = os.environ.get('PAYMONGO_SECRET_KEY', '')
+PAYMONGO_WEBHOOK_SECRET = os.environ.get('PAYMONGO_WEBHOOK_SECRET', '')
+# Methods offered on the hosted checkout page (each must be enabled on your PayMongo account)
+PAYMONGO_PAYMENT_METHODS = [m.strip() for m in os.environ.get(
+    'PAYMONGO_PAYMENT_METHODS', 'qrph,gcash,paymaya,card,grab_pay').split(',') if m.strip()]
+# Unpaid online orders are cancelled and their stock returned after this long
+PAYMONGO_ORDER_TTL_MINUTES = int(os.environ.get('PAYMONGO_ORDER_TTL_MINUTES', '60'))
 
-# The base URL of your React frontend (used to build Stripe success/cancel redirect URLs)
+# ─── Email ────────────────────────────────────────────────────────────────────
+# With EMAIL_HOST_USER set, mail goes out over SMTP (Gmail by default: use an App Password).
+# Without it, emails are printed in the runserver terminal instead, so development needs no account.
+EMAIL_HOST_USER     = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_HOST          = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT          = int(os.environ.get('EMAIL_PORT', '587'))
+EMAIL_USE_TLS       = os.environ.get('EMAIL_USE_TLS', 'true').lower() in ('1', 'true', 'yes')
+EMAIL_TIMEOUT       = 15  # seconds; a slow mail server must not hang the request
+EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND') or (
+    'django.core.mail.backends.smtp.EmailBackend' if EMAIL_HOST_USER
+    else 'django.core.mail.backends.console.EmailBackend')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL') or (
+    f'Garden Studio <{EMAIL_HOST_USER}>' if EMAIL_HOST_USER else 'Garden Studio <noreply@gardenstudio.local>')
+
+# The base URL of your React frontend (used to build payment success/cancel redirect URLs)
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 
 # Daily limits per account. An AI layout run makes 1 Gemini request (the other two

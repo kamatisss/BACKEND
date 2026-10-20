@@ -11,7 +11,8 @@ from .reviews import moderate_review, review_highlights, review_moderation_list
 from .views_api import (
     InventoryItemViewSet, GardenDesignViewSet, RegisterView, BlackoutDateViewSet,
     ServiceBookingViewSet, checkout, OrderViewSet, create_checkout_session,
-    stripe_webhook, reset_password, UserViewSet, AttendanceViewSet,
+    paymongo_webhook, order_receipt, project_payment_detail, project_payment_checkout,
+    reset_password, UserViewSet, AttendanceViewSet,
     NotificationViewSet, GenerateLayoutsView, upload_design_image, ServiceReviewViewSet,
     ProjectTrackerViewSet, ProductReviewViewSet,
 )
@@ -43,7 +44,10 @@ urlpatterns = [
     path('register/', RegisterView.as_view(), name='auth_register'),
     path('checkout/', checkout, name='checkout'),
     path('create-checkout-session/', create_checkout_session, name='create_checkout_session'),
-    path('stripe-webhook/', stripe_webhook, name='stripe_webhook'),
+    path('paymongo-webhook/', paymongo_webhook, name='paymongo_webhook'),
+    path('order-receipt/<int:pk>/', order_receipt, name='order_receipt'),
+    path('project-payments/<str:token>/', project_payment_detail, name='project_payment_detail'),
+    path('project-payments/<str:token>/checkout/', project_payment_checkout, name='project_payment_checkout'),
     path('reset-password/', reset_password, name='reset_password'),
     path('upload-design-image/', upload_design_image, name='upload_design_image'),
     path('analytics/income/', income_analytics, name='income-analytics'),
